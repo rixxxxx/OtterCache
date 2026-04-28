@@ -1,13 +1,13 @@
-# lutris-gog-fetch
+# OtterCache
 
-[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://github.com/rixxxxx/lutris-gog-fetch/blob/main/LICENSE)
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://github.com/rixxxxx/ottercache/blob/main/LICENSE)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](https://kernel.org)
 [![Lutris](https://img.shields.io/badge/Lutris-compatible-FF6600?logo=lutris&logoColor=white)](https://lutris.net)
 [![LGOGDownloader](https://img.shields.io/badge/LGOGDownloader-3.18.279b883-informational)](https://github.com/Sude-/lgogdownloader)
 [![GOG](https://img.shields.io/badge/GOG-DRM--free-86328A?logo=gog.com&logoColor=white)](https://www.gog.com)
 
-Back up Lutris installer scripts and deeplink resources for your entire GOG library — so you can install and run your games fully offline via [Lutris](https://lutris.net).
+Cache your Lutris installer scripts and all referenced resources locally — so your GOG games run fully offline, no internet required, ever.
 
 ## Motivation
 
@@ -96,15 +96,15 @@ lgogdownloader \
 ## Installation
 
 ```bash
-git clone https://github.com/youruser/lutris-gog-fetch.git
-cd lutris-gog-fetch
-chmod +x lutris-gog-fetch.sh
+git clone https://github.com/rixxxxx/ottercache.git
+cd ottercache
+chmod +x ottercache.sh
 ```
 
 ## Usage
 
 ```
-lutris-gog-fetch --gog-dir <path> --output-dir <path> [OPTIONS]
+ottercache.sh --gog-dir <path> --output-dir <path> [OPTIONS]
 ```
 
 ### Required arguments
@@ -129,39 +129,39 @@ lutris-gog-fetch --gog-dir <path> --output-dir <path> [OPTIONS]
 
 **Dry run — preview what would be fetched:**
 ```bash
-./lutris-gog-fetch.sh \
+./ottercache.sh \
   --gog-dir ~/GOG-Backup \
-  --output-dir ~/Lutris-Scripts \
+  --output-dir ~/OtterCache \
   --dry-run
 ```
 
 **Full run:**
 ```bash
-./lutris-gog-fetch.sh \
+./ottercache.sh \
   --gog-dir ~/GOG-Backup \
-  --output-dir ~/Lutris-Scripts
+  --output-dir ~/OtterCache
 ```
 
 **Scripts only, no resource downloads:**
 ```bash
-./lutris-gog-fetch.sh \
+./ottercache.sh \
   --gog-dir ~/GOG-Backup \
-  --output-dir ~/Lutris-Scripts \
+  --output-dir ~/OtterCache \
   --no-resources
 ```
 
 **Re-run after a partial failure, overwriting existing files:**
 ```bash
-./lutris-gog-fetch.sh \
+./ottercache.sh \
   --gog-dir ~/GOG-Backup \
-  --output-dir ~/Lutris-Scripts \
+  --output-dir ~/OtterCache \
   --force
 ```
 
 ## Output structure
 
 ```
-~/Lutris-Scripts/
+~/OtterCache/
 ├── fallout-gog_2024-04-27_wine_published/
 │   ├── fallout-gog.json                # Raw API response
 │   ├── fallout-gog.yaml                # Original Lutris installer script
@@ -224,10 +224,10 @@ Every run produces a summary in `<output-dir>/reports/` containing:
 
 ## License
 
-This project is licensed under the [GNU General Public License v2.0](https://github.com/rixxxxx/lutris-gog-fetch/blob/main/LICENSE).
+This project is licensed under the [GNU General Public License v2.0](https://github.com/rixxxxx/ottercache/blob/main/LICENSE).
 
 ```
-lutris-gog-fetch – Back up Lutris scripts & resources for GOG games
+OtterCache – Cache Lutris scripts & resources for offline GOG gaming
 Copyright (C) 2026  rixxxxx
 
 This program is free software; you can redistribute it and/or modify
