@@ -72,6 +72,7 @@ lgogdownloader \
   --check-free-space true \
   --no-fast-status-check \
   --automatic-xml-creation \
+  --xml-directory ~/GOG-Backup/lgogdownloader-gog-xml \
   --limit-rate 0 \
   --save-serials \
   --save-game-details-json \
