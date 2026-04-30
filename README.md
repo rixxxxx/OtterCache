@@ -15,12 +15,12 @@ GOG sells DRM-free games, but getting them to run on Linux still requires the ri
 
 The problem: Lutris fetches those scripts on demand from `lutris.net`. If you want to play offline — on a travel laptop, in a cabin, or simply without depending on an external service — you need those scripts locally.
 
-`lutris-gog-fetch` bridges that gap. It scans your locally downloaded GOG library, looks up every game on `lutris.net`, and saves the installer scripts along with all referenced resources (patches, configuration files, helper binaries) to disk.
+`OtterCache` bridges that gap. It scans your locally downloaded GOG library, looks up every game on `lutris.net`, and saves the installer scripts along with all referenced resources (patches, configuration files, helper binaries) to disk.
 
 ## How it works
 
 ```
-LGOGDownloader          lutris-gog-fetch                    Lutris (offline)
+LGOGDownloader          OtterCache                          Lutris (offline)
 ──────────────    →     ────────────────────────────────    ────────────────
 Downloads your          1. Fetches installer scripts        Installs & runs
 GOG library to          2. Downloads deeplink resources     your games using
@@ -83,7 +83,7 @@ lgogdownloader \
   --progress-interval 1000
 ```
 
-> **Important:** `--save-product-json` is required. `lutris-gog-fetch` relies on the generated `product_*.json` files as its primary game detection source. Without them, game names are guessed from installer filenames, which is less reliable.
+> **Important:** `--save-product-json` is required. `ottercache` relies on the generated `product_*.json` files as its primary game detection source. Without them, game names are guessed from installer filenames, which is less reliable.
 
 ### 3. Runtime dependencies
 
@@ -186,7 +186,7 @@ Each installer folder contains two YAML files:
 
 ## Offline installation workflow
 
-Once `lutris-gog-fetch` has completed, install a game fully offline:
+Once `ottercache` has completed, install a game fully offline:
 
 1. Open Lutris
 2. Click **+** → **Install a game from a local script**
@@ -198,7 +198,7 @@ Once `lutris-gog-fetch` has completed, install a game fully offline:
 
 ## Game detection
 
-`lutris-gog-fetch` detects games from your GOG library using three sources, in order of priority:
+`ottercache` detects games from your GOG library using three sources, in order of priority:
 
 1. **`product_*.json` files** — exact titles from GOG metadata (most reliable)
 2. **Installer filenames** — parsed from `setup_*.exe` and `*.sh` files
@@ -220,7 +220,7 @@ Every run produces a summary in `<output-dir>/reports/` containing:
 - **Lutris coverage:** Not every GOG game has a community installer on `lutris.net`. Skipped games are listed in the summary.
 - **Broken deeplinks:** Some installer scripts reference files that have since moved or been deleted. These are flagged in the report.
 - **Rate limiting:** `lutris.net` may throttle requests. Increase `--api-delay` if you see frequent API errors.
-- **Online required for fetching:** `lutris-gog-fetch` itself requires internet access to query `lutris.net`. The resulting scripts and resources work fully offline.
+- **Online required for fetching:** `ottercache` itself requires internet access to query `lutris.net`. The resulting scripts and resources work fully offline.
 
 ## License
 
