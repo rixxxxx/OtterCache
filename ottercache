@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# lutris-gog-fetch  –  Back up Lutris scripts & resources for GOG games
+# ottercache  –  Back up Lutris scripts & resources for GOG games
 #
 # Prerequisite: LGOGDownloader (tested with version 3.18.279b883)
 #   https://github.com/Sude-/lgogdownloader.git
@@ -29,8 +29,8 @@
 #     --include-hidden-products \
 #     --progress-interval 1000
 #
-# Note: --save-product-json is required, as lutris-gog-fetch relies on the
-# generated product_*.json files as its primary game detection source.
+# Note: --save-product-json is required, as ottercache relies on the generated
+# product_*.json files as its primary game detection source.
 # =============================================================================
 set -uo pipefail
 
@@ -45,9 +45,7 @@ readonly RED=$'\033[0;31m'   GREEN=$'\033[0;32m'  YELLOW=$'\033[1;33m'
 readonly BLUE=$'\033[0;34m'  CYAN=$'\033[0;36m'   MAGENTA=$'\033[0;35m'
 readonly BOLD=$'\033[1m'     DIM=$'\033[2m'        NC=$'\033[0m'
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-# Alle Log-Funktionen schreiben auf stderr, damit sie sicher in $() aufgerufen
-# werden können, ohne den stdout-Rückgabewert zu verschmutzen.
+# ── Logging (all log functions write to stderr) ──────────────────────────────
 log_info()    { echo -e "${BLUE}[INFO]${NC}     $*" >&2; }
 log_ok()      { echo -e "${GREEN}[OK]${NC}       $*" >&2; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC}     $*" >&2; }
@@ -62,14 +60,366 @@ print_header() {
 }
 print_section() { echo -e "\n${BOLD}${MAGENTA}── $* ──${NC}" >&2; }
 
+# ── Global state ──────────────────────────────────────────────────────────────
+declare -A GAMES=()
+declare -A SLUG_SEEN=()
+declare -a BROKEN_LINKS=()
+declare -a RESOURCE_ERRORS=()
+declare -a SKIPPED_GAMES=()
+declare -a DUPLICATE_SLUGS=()
+declare -a SUCCESS_INSTALLERS=()
+declare -a CACHED_INSTALLERS=()
+declare -a LOCALIZED_YAMLS=()
+declare -a PRUNED_DIRS=()
+
+GOG_DIR=""
+OUTPUT_DIR=""
+DRY_RUN=false
+FORCE=false
+QUIET=false
+NO_RESOURCES=false
+PRUNE_OLD=false
+API_DELAY=1
+TIMESTAMP=""
+DIR_REPORTS=""
+DIR_RUN=""
+HELPER_PY=""
+SLUG_CACHE_FILE=""
+TOTAL=0
+
+# ── Python helper (single consolidated script with subcommand dispatch) ──────
+# All Python logic lives here. Written once to a temp file at startup,
+# called as: python3 "$HELPER_PY" <subcommand> [args...]
+# This keeps Python syntax (parens, braces, regex) entirely out of bash parsing.
+_write_helper_python() {
+    cat << 'PYEOF'
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.parse
+
+
+def cmd_url_to_filename():
+    url = sys.argv[2]
+    p = urllib.parse.urlparse(url)
+    name = os.path.basename(urllib.parse.unquote(p.path))
+    print(name if name and '.' in name else 'resource_unknown')
+
+
+def cmd_product_title():
+    try:
+        d = json.load(open(sys.argv[2]))
+        print(d.get('title', '').strip())
+    except Exception:
+        pass
+
+
+def cmd_slug_candidates():
+    title = sys.argv[2].strip()
+
+    def to_slug(s):
+        return re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')
+
+    variants = [
+        title,
+        re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip(),
+        re.sub(r'\s*\([^)]*\)\s*$', '', title).strip(),
+        re.sub(r'\s*:\s*.*$', '', re.sub(r'[™®†‡]', '', title)).strip(),
+    ]
+
+    seen = set()
+    for variant in variants:
+        s = to_slug(variant)
+        if s and s not in seen:
+            seen.add(s)
+            print(s)
+
+
+def cmd_search_names():
+    title = sys.argv[2].strip()
+    seen = []
+    candidates = [
+        title,
+        re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip(),
+        re.sub(r'\s*\([^)]*\)\s*$', '', title).strip(),
+    ]
+    for n in candidates:
+        if n and n not in seen:
+            seen.append(n)
+            print(n)
+
+
+def cmd_has_game_id():
+    try:
+        d = json.load(open(sys.argv[2]))
+        sys.exit(0 if d.get('id') else 1)
+    except Exception:
+        sys.exit(1)
+
+
+def cmd_url_encode():
+    print(urllib.parse.quote(sys.argv[2]))
+
+
+def cmd_find_slug_in_results():
+    query = sys.argv[2].lower().strip()
+    results_file = sys.argv[3]
+    query_slug = re.sub(r'[^a-z0-9]+', '-', query).strip('-')
+    query_noyear = re.sub(r'-\d{4}$', '', query_slug)
+    query_noyear_name = re.sub(r'\s*\(\d{4}\)\s*$', '', query).strip()
+
+    try:
+        results = json.load(open(results_file)).get('results', [])
+        if not results:
+            sys.exit(1)
+        checks = [
+            lambda r: r.get('slug') == query_slug,
+            lambda r: r.get('slug') == query_noyear,
+            lambda r: r.get('name', '').lower().strip() == query,
+            lambda r: r.get('name', '').lower().strip() == query_noyear_name,
+            lambda r: r.get('slug', '').startswith(query_noyear),
+        ]
+        for check in checks:
+            for r in results:
+                if check(r):
+                    print(r['slug'])
+                    sys.exit(0)
+        print(results[0].get('slug', ''))
+    except Exception:
+        sys.exit(1)
+
+
+def cmd_parse_installers():
+    try:
+        data = json.load(open(sys.argv[2]))
+        for inst in data.get('installers', []):
+            slug = inst.get('slug', '')
+            runner = inst.get('runner', 'unknown')
+            updated = (inst.get('updated_at') or inst.get('created_at') or '')[:10]
+            status = 'published' if inst.get('published', False) else 'unpublished'
+            if slug:
+                print(slug + '\t' + runner + '\t' + updated + '\t' + status)
+    except Exception:
+        pass
+
+
+def cmd_extract_urls():
+    target_slug = sys.argv[3]
+    try:
+        data = json.load(open(sys.argv[2]))
+        for inst in data.get('installers', []):
+            if inst.get('slug') != target_slug:
+                continue
+            for f in inst.get('script', {}).get('files', []):
+                if not isinstance(f, dict):
+                    continue
+                for k, v in f.items():
+                    if isinstance(v, str) and v.startswith('http'):
+                        print(v)
+                    elif isinstance(v, dict) and 'url' in v:
+                        print(v['url'])
+    except Exception:
+        pass
+
+
+def cmd_save_installer_json():
+    target_slug = sys.argv[3]
+    dest_dir = sys.argv[4]
+    data = json.load(open(sys.argv[2]))
+    for inst in data.get('installers', []):
+        if inst.get('slug') != target_slug:
+            continue
+        fname = re.sub(r'[^\w\-.]', '_', target_slug) + '.json'
+        with open(os.path.join(dest_dir, fname), 'w') as f:
+            json.dump(inst, f, indent=2, ensure_ascii=False)
+        break
+
+
+def cmd_save_installer_yaml():
+    target_slug = sys.argv[3]
+    dest_file = sys.argv[4]
+    data = json.load(open(sys.argv[2]))
+    for inst in data.get('installers', []):
+        if inst.get('slug') != target_slug:
+            continue
+        content = inst.get('content', '')
+        if content:
+            with open(dest_file, 'w') as f:
+                f.write(content)
+        break
+
+
+def cmd_cache_get():
+    try:
+        data = json.load(open(sys.argv[2]))
+        print(data.get(sys.argv[3], {}).get('slug', ''))
+    except Exception:
+        pass
+
+
+def cmd_cache_check():
+    try:
+        data = json.load(open(sys.argv[2]))
+        dirs = data.get(sys.argv[3], {}).get('dirs', [])
+        outdir = sys.argv[4]
+        if not dirs:
+            sys.exit(1)
+        for d in dirs:
+            if not os.path.isdir(os.path.join(outdir, d)):
+                sys.exit(1)
+        sys.exit(0)
+    except Exception:
+        sys.exit(1)
+
+
+def cmd_cache_update():
+    cache_file = sys.argv[2]
+    key = sys.argv[3]
+    slug = sys.argv[4]
+    dirs = sys.argv[5:]
+    try:
+        data = json.load(open(cache_file))
+    except Exception:
+        data = {}
+    data[key] = {'slug': slug, 'dirs': dirs}
+    with open(cache_file, 'w') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def cmd_find_outdated():
+    output_dir = sys.argv[2]
+    date_re = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})_(.+)$')
+    groups = {}
+    for entry in os.scandir(output_dir):
+        if not entry.is_dir():
+            continue
+        m = date_re.match(entry.name)
+        if not m:
+            continue
+        prefix, date, suffix = m.groups()
+        key = prefix + '_' + suffix
+        groups.setdefault(key, []).append((date, entry.name))
+    result = {}
+    for key, versions in groups.items():
+        if len(versions) <= 1:
+            continue
+        versions.sort(key=lambda v: v[0], reverse=True)
+        result[key] = {
+            'keep': versions[0][1],
+            'remove': [v[1] for v in versions[1:]]
+        }
+    print(json.dumps(result))
+
+
+def cmd_prune_preview():
+    data = json.loads(sys.argv[2])
+    for info in data.values():
+        for old in info['remove']:
+            print(old + '  ->  would be replaced by  ->  ' + info['keep'])
+
+
+def cmd_prune_apply():
+    data = json.loads(sys.argv[2])
+    outdir = sys.argv[3]
+    for info in data.values():
+        for old in info['remove']:
+            shutil.rmtree(os.path.join(outdir, old))
+            print(old)
+
+
+def cmd_localize_yaml():
+    try:
+        import yaml
+    except ImportError:
+        print('ERROR: python3-yaml not installed', file=sys.stderr)
+        sys.exit(1)
+
+    yaml_file = sys.argv[2]
+    resource_dir = sys.argv[3]
+    offline_yaml = sys.argv[4]
+
+    try:
+        with open(yaml_file) as f:
+            data = yaml.safe_load(f)
+    except Exception as e:
+        print('ERROR: ' + str(e), file=sys.stderr)
+        sys.exit(1)
+
+    files = data.get('script', {}).get('files', [])
+    patched = 0
+
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        for key, value in list(entry.items()):
+            if isinstance(value, str) and value.startswith('http'):
+                url = value
+            elif isinstance(value, dict) and str(value.get('url', '')).startswith('http'):
+                url = value['url']
+            else:
+                continue
+
+            fname = os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path))
+            local_path = os.path.join(resource_dir, fname)
+
+            if not os.path.exists(local_path):
+                continue
+
+            file_uri = 'file://' + os.path.abspath(local_path)
+            if isinstance(value, str):
+                entry[key] = file_uri
+            else:
+                value['url'] = file_uri
+            patched += 1
+
+    with open(offline_yaml, 'w') as f:
+        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    print(patched)
+
+
+# ── Dispatch ────────────────────────────────────────────────────────────────
+COMMANDS = {
+    'url_to_filename':       cmd_url_to_filename,
+    'product_title':         cmd_product_title,
+    'slug_candidates':       cmd_slug_candidates,
+    'search_names':          cmd_search_names,
+    'has_game_id':           cmd_has_game_id,
+    'url_encode':            cmd_url_encode,
+    'find_slug_in_results':  cmd_find_slug_in_results,
+    'parse_installers':      cmd_parse_installers,
+    'extract_urls':          cmd_extract_urls,
+    'save_installer_json':   cmd_save_installer_json,
+    'save_installer_yaml':   cmd_save_installer_yaml,
+    'cache_get':             cmd_cache_get,
+    'cache_check':           cmd_cache_check,
+    'cache_update':          cmd_cache_update,
+    'find_outdated':         cmd_find_outdated,
+    'prune_preview':         cmd_prune_preview,
+    'prune_apply':           cmd_prune_apply,
+    'localize_yaml':         cmd_localize_yaml,
+}
+
+if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+    print('Usage: helper.py <command> [args...]', file=sys.stderr)
+    sys.exit(2)
+
+COMMANDS[sys.argv[1]]()
+PYEOF
+}
+
+py() { python3 "$HELPER_PY" "$@"; }
+
 # ── Usage ─────────────────────────────────────────────────────────────────────
 print_usage() {
 cat << EOF
 
-${BOLD}lutris-gog-fetch${NC} – Back up Lutris installer scripts & deeplink resources for GOG games
+${BOLD}ottercache${NC} – Back up Lutris installer scripts & deeplink resources for GOG games
 
 ${BOLD}USAGE:${NC}
-  lutris-gog-fetch --gog-dir <path> --output-dir <path> [OPTIONS]
+  ottercache --gog-dir <path> --output-dir <path> [OPTIONS]
 
 ${BOLD}REQUIRED:${NC}
   -g, --gog-dir     <path>   Directory containing downloaded GOG games
@@ -84,25 +434,11 @@ ${BOLD}OPTIONS:${NC}
       --api-delay  <sec>     Pause between API requests (default: 1)
   -h, --help                 Show this help
 
-${BOLD}OUTPUT STRUCTURE:${NC}
-  <output-dir>/
-  ├── <slug>_<updated>_<runner>_<status>/
-  │   ├── <slug>.json
-  │   ├── <slug>.yaml
-  │   └── <resource-file>
-  └── reports/
-      ├── run_YYYY-MM-DD_HH-MM.log
-      └── summary_YYYY-MM-DD_HH-MM.txt
-
 EOF
 }
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 parse_args() {
-    GOG_DIR="" OUTPUT_DIR=""
-    DRY_RUN=false FORCE=false QUIET=false NO_RESOURCES=false PRUNE_OLD=false
-    API_DELAY=1
-
     [[ $# -eq 0 ]] && { print_usage; exit 0; }
 
     while [[ $# -gt 0 ]]; do
@@ -136,12 +472,27 @@ suppress_info_in_quiet_mode() {
 setup_output_dirs() {
     TIMESTAMP=$(date +"%Y-%m-%d_%H-%M")
     DIR_REPORTS="$OUTPUT_DIR/reports"
-    $DRY_RUN || mkdir -p "$DIR_REPORTS"
+    DIR_RUN="$DIR_REPORTS/runs/$TIMESTAMP"
+    if ! $DRY_RUN; then
+        mkdir -p "$DIR_REPORTS"
+        mkdir -p "$DIR_RUN"
+    fi
 }
 
 start_logging() {
-    local log_file="$DIR_REPORTS/run_${TIMESTAMP}.log"
+    local log_file="$DIR_RUN/run.log"
     $DRY_RUN || exec > >(tee -a "$log_file") 2>&1
+}
+
+setup_helper_python() {
+    HELPER_PY=$(mktemp /tmp/ottercache_helper_XXXXXX.py)
+    _write_helper_python > "$HELPER_PY"
+    SLUG_CACHE_FILE="$DIR_REPORTS/slug_cache.json"
+    $DRY_RUN || [[ -f "$SLUG_CACHE_FILE" ]] || echo '{}' > "$SLUG_CACHE_FILE"
+}
+
+cleanup_helper() {
+    [[ -n "$HELPER_PY" && -f "$HELPER_PY" ]] && rm -f "$HELPER_PY"
 }
 
 check_dependencies() {
@@ -157,7 +508,7 @@ check_dependencies() {
     done
     python3 -c "import yaml" 2>/dev/null \
         && log_ok "python3-yaml available" \
-        || log_warn "python3-yaml not found (fallback active)"
+        || log_warn "python3-yaml not found – offline localization disabled"
     [[ "$missing" -gt 0 ]] && { log_error "Missing required dependencies"; exit 1; }
 }
 
@@ -171,24 +522,16 @@ to_safe_name() {
               | sed 's/[^a-z0-9._-]/-/g; s/--*/-/g; s/^-//; s/-$//'
 }
 
-url_to_filename() {
-    python3 -c "
-from urllib.parse import urlparse, unquote
-import os
-p = urlparse('$1')
-n = os.path.basename(unquote(p.path))
-print(n if n and '.' in n else 'resource_$(date +%s%N)')
-" 2>/dev/null || echo "resource_unknown"
-}
-
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 http_get() {
     local url="$1" out_file="$2"
-    curl -s -o "$out_file" -w "%{http_code}" \
+    local code
+    code=$(curl -s -o "$out_file" -w "%{http_code}" \
         --max-time "$CURL_TIMEOUT" \
         --header "Accept: application/json" \
         --user-agent "$USER_AGENT" \
-        "$url" 2>/dev/null | grep -oE '^[0-9]{3}' || echo "000"
+        "$url" 2>/dev/null | grep -oE '^[0-9]{3}' || true)
+    echo "${code:-000}"
 }
 
 check_url_status() {
@@ -205,7 +548,7 @@ is_http_success() {
     case "$1" in 200|206|301|302) return 0 ;; *) return 1 ;; esac
 }
 
-# ── Game detection (Phase 1) ──────────────────────────────────────────────────
+# ── Game detection ────────────────────────────────────────────────────────────
 extract_gog_id_from_filename() {
     echo "$1" | grep -oP '[[(]?\K\d{9,10}(?=[)]]|[._\- ]|$)' | head -1 || true
 }
@@ -233,13 +576,7 @@ scan_product_json_files() {
     log_info "Scanning product_*.json metadata in: $GOG_DIR"
     while IFS= read -r json_file; do
         local title
-        title=$(python3 -c "
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    print(d.get('title','').strip())
-except: pass
-" "$json_file" 2>/dev/null || true)
+        title=$(py product_title "$json_file" 2>/dev/null || true)
         [[ -n "$title" ]] && register_game "$title"
     done < <(find "$GOG_DIR" -maxdepth 2 -name "product_*.json" 2>/dev/null)
     log_info "product_*.json: ${#GAMES[@]} games found"
@@ -283,52 +620,21 @@ detect_games() {
     $DRY_RUN || printf '%s\n' "${GAMES[@]}" | sort > "$DIR_REPORTS/detected_games.txt"
 }
 
-# ── Slug resolution (Phase 2 helpers) ────────────────────────────────────────
-generate_slug_candidates() {
-    python3 -c "
-import re, sys
-title = sys.argv[1].strip()
-
-def to_slug(s):
-    return re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')
-
-seen, candidates = set(), []
-for variant in [
-    title,
-    re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip(),
-    re.sub(r'\s*\([^)]*\)\s*$', '', title).strip(),
-    re.sub(r'\s*:\s*.*$', '', re.sub(r'[™®†‡]', '', title)).strip(),
-]:
-    s = to_slug(variant)
-    if s and s not in seen:
-        seen.add(s); candidates.append(s)
-
-for c in candidates: print(c)
-" "$1" 2>/dev/null || true
-}
-
+# ── Slug resolution ───────────────────────────────────────────────────────────
 try_direct_slug() {
     local candidate_slug="$1" tmp_file="$2"
     log_info "Trying direct slug: $candidate_slug"
     local code
     code=$(http_get "${LUTRIS_API}/games/${candidate_slug}/installers?format=json" "$tmp_file")
     [[ "$code" != "200" ]] && return 1
-    python3 -c "
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    exit(0 if d.get('id') else 1)
-except: exit(1)
-" "$tmp_file" 2>/dev/null
+    py has_game_id "$tmp_file" 2>/dev/null
 }
 
 resolve_slug_by_name() {
     local search_name="$1" tmp_file="$2"
     log_info "Searching by name: $search_name"
     local encoded
-    encoded=$(python3 -c \
-        "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" \
-        "$search_name" 2>/dev/null || echo "$search_name")
+    encoded=$(py url_encode "$search_name" 2>/dev/null || echo "$search_name")
 
     local code
     code=$(http_get "${LUTRIS_API}/games?search=${encoded}&format=json" "$tmp_file")
@@ -337,35 +643,13 @@ resolve_slug_by_name() {
         return 2
     fi
 
-    python3 -c "
-import json, sys, re
-query = sys.argv[1].lower().strip()
-query_slug = re.sub(r'[^a-z0-9]+', '-', query).strip('-')
-query_noyear = re.sub(r'-\d{4}$', '', query_slug)
-query_noyear_name = re.sub(r'\s*\(\d{4}\)\s*$', '', query).strip()
-
-try:
-    results = json.load(open(sys.argv[2])).get('results', [])
-    if not results: sys.exit(1)
-    for check in [
-        lambda r: r.get('slug') == query_slug,
-        lambda r: r.get('slug') == query_noyear,
-        lambda r: r.get('name','').lower().strip() == query,
-        lambda r: r.get('name','').lower().strip() == query_noyear_name,
-        lambda r: r.get('slug','').startswith(query_noyear),
-    ]:
-        for r in results:
-            if check(r): print(r['slug']); sys.exit(0)
-    print(results[0].get('slug',''))
-except: sys.exit(1)
-" "$search_name" "$tmp_file" 2>/dev/null || true
+    py find_slug_in_results "$search_name" "$tmp_file" 2>/dev/null || true
 }
 
 resolve_game_slug() {
     local game_name="$1"
     local tmp slug=""
-
-    tmp=$(mktemp /tmp/lutris_XXXXXX.json)
+    tmp=$(mktemp /tmp/ottercache_XXXXXX.json)
 
     while IFS= read -r candidate; do
         [[ -z "$candidate" ]] && continue
@@ -375,7 +659,7 @@ resolve_game_slug() {
             break
         fi
         sleep 0.3
-    done < <(generate_slug_candidates "$game_name")
+    done < <(py slug_candidates "$game_name" 2>/dev/null)
 
     if [[ -z "$slug" ]]; then
         while IFS= read -r search_name; do
@@ -389,15 +673,7 @@ resolve_game_slug() {
                 slug="$result"; break
             fi
             sleep 0.3
-        done < <(python3 -c "
-import re, sys
-title = sys.argv[1].strip()
-seen = []
-for n in [title,
-          re.sub(r'\s*\(\d{4}\)\s*$','',title).strip(),
-          re.sub(r'\s*\([^)]*\)\s*$','',title).strip()]:
-    if n and n not in seen: seen.append(n); print(n)
-" "$game_name" 2>/dev/null || true)
+        done < <(py search_names "$game_name" 2>/dev/null)
     fi
 
     rm -f "$tmp"
@@ -410,64 +686,9 @@ fetch_installer_data() {
     http_get "${LUTRIS_API}/games/${game_slug}/installers?format=json" "$out_file"
 }
 
-parse_installers() {
-    python3 -c "
-import json, sys
-try:
-    data = json.load(open(sys.argv[1]))
-    for inst in data.get('installers', []):
-        slug    = inst.get('slug', '')
-        runner  = inst.get('runner', 'unknown')
-        updated = (inst.get('updated_at') or inst.get('created_at') or '')[:10]
-        status  = 'published' if inst.get('published', False) else 'unpublished'
-        if slug: print(f'{slug}\t{runner}\t{updated}\t{status}')
-except: pass
-" "$1" 2>/dev/null
-}
-
-extract_installer_urls() {
-    local data_file="$1" installer_slug="$2"
-    python3 -c "
-import json, sys
-try:
-    data = json.load(open(sys.argv[1]))
-    for inst in data.get('installers', []):
-        if inst.get('slug') != sys.argv[2]: continue
-        for f in inst.get('script', {}).get('files', []):
-            if not isinstance(f, dict): continue
-            for k, v in f.items():
-                if isinstance(v, str) and v.startswith('http'): print(v)
-                elif isinstance(v, dict) and 'url' in v:        print(v['url'])
-except: pass
-" "$data_file" "$installer_slug" 2>/dev/null
-}
-
-save_installer_json() {
-    local data_file="$1" installer_slug="$2" dest_dir="$3"
-    python3 -c "
-import json, re, sys
-data = json.load(open(sys.argv[1]))
-for inst in data.get('installers', []):
-    if inst.get('slug') != sys.argv[2]: continue
-    fname = re.sub(r'[^\w\-.]', '_', sys.argv[2]) + '.json'
-    with open(sys.argv[3] + '/' + fname, 'w') as f:
-        json.dump(inst, f, indent=2, ensure_ascii=False)
-    break
-" "$data_file" "$installer_slug" "$dest_dir" 2>/dev/null
-}
-
-save_installer_yaml() {
-    local data_file="$1" installer_slug="$2" dest_file="$3"
-    python3 -c "
-import json, sys
-data = json.load(open(sys.argv[1]))
-for inst in data.get('installers', []):
-    if inst.get('slug') != sys.argv[2]: continue
-    content = inst.get('content', '')
-    if content:
-        with open(sys.argv[3], 'w') as f: f.write(content)
-    break
-" "$data_file" "$installer_slug" "$dest_file" 2>/dev/null
+make_dir_name() {
+    local slug="$1" updated="$2" runner="$3" status="$4"
+    echo "$(to_safe_name "$slug")_${updated}_$(to_safe_name "$runner")_$(to_safe_name "$status")"
 }
 
 # ── Resource handling ─────────────────────────────────────────────────────────
@@ -496,7 +717,7 @@ print_url_status() {
 check_resources_dry_run() {
     local data_file="$1" installer_slug="$2" dir_name="$3"
     local urls=()
-    mapfile -t urls < <(extract_installer_urls "$data_file" "$installer_slug")
+    mapfile -t urls < <(py extract_urls "$data_file" "$installer_slug")
 
     if [[ "${#urls[@]}" -eq 0 ]]; then
         log_dryrun "  No deeplink resources"
@@ -505,7 +726,7 @@ check_resources_dry_run() {
 
     for url in "${urls[@]}"; do
         local fname http_code
-        fname=$(url_to_filename "$url")
+        fname=$(py url_to_filename "$url")
         printf "  ${MAGENTA}[DRY-RUN]${NC}  %-45s " "$fname" >&2
         http_code=$(check_url_status "$url")
         print_url_status "$fname" "$http_code" "$dir_name" "$url"
@@ -516,7 +737,7 @@ check_resources_dry_run() {
 download_resource() {
     local url="$1" out_file="$2" dir_name="$3"
     local fname http_code
-    fname=$(url_to_filename "$url")
+    fname=$(py url_to_filename "$url")
 
     if [[ -f "$out_file" ]] && ! $FORCE; then
         log_skip "Already exists: $fname"
@@ -547,7 +768,7 @@ download_resource() {
 download_resources() {
     local data_file="$1" installer_slug="$2" inst_dir="$3" dir_name="$4"
     local urls=()
-    mapfile -t urls < <(extract_installer_urls "$data_file" "$installer_slug")
+    mapfile -t urls < <(py extract_urls "$data_file" "$installer_slug")
 
     if [[ "${#urls[@]}" -eq 0 ]]; then
         log_info "No deeplink resources found"
@@ -557,18 +778,13 @@ download_resources() {
     log_info "${#urls[@]} resource(s) found"
     for url in "${urls[@]}"; do
         local fname
-        fname=$(url_to_filename "$url")
+        fname=$(py url_to_filename "$url")
         download_resource "$url" "$inst_dir/$fname" "$dir_name"
         sleep 0.3
     done
 }
 
-# ── Single installer processing ───────────────────────────────────────────────
-make_dir_name() {
-    local slug="$1" updated="$2" runner="$3" status="$4"
-    echo "$(to_safe_name "$slug")_${updated}_$(to_safe_name "$runner")_$(to_safe_name "$status")"
-}
-
+# ── Per-installer processing ──────────────────────────────────────────────────
 process_installer_dry_run() {
     local data_file="$1" installer_slug="$2" dir_name="$3"
     log_dryrun "Would create folder: $OUTPUT_DIR/$dir_name"
@@ -581,8 +797,8 @@ process_installer_real() {
     safe_slug=$(to_safe_name "$installer_slug")
 
     mkdir -p "$inst_dir"
-    save_installer_json "$data_file" "$installer_slug" "$inst_dir"
-    save_installer_yaml "$data_file" "$installer_slug" "$inst_dir/${safe_slug}.yaml"
+    py save_installer_json "$data_file" "$installer_slug" "$inst_dir" 2>/dev/null
+    py save_installer_yaml "$data_file" "$installer_slug" "$inst_dir/${safe_slug}.yaml" 2>/dev/null
     [[ -f "$inst_dir/${safe_slug}.yaml" ]] && log_ok "YAML saved: ${safe_slug}.yaml"
 
     $NO_RESOURCES || download_resources "$data_file" "$installer_slug" "$inst_dir" "$dir_name"
@@ -598,10 +814,16 @@ process_installer() {
     dir_name=$(make_dir_name "$installer_slug" "${updated:-0000-00-00}" "$runner" "$status")
     inst_dir="$OUTPUT_DIR/$dir_name"
 
-    echo ""
+    echo "" >&2
     log_info "Installer : $installer_slug"
     log_info "Runner    : $runner  |  Updated: $updated  |  Status: $status"
     log_info "Folder    : $dir_name"
+
+    if [[ -d "$inst_dir" ]] && ! $FORCE; then
+        log_skip "Already cached – skipping"
+        CACHED_INSTALLERS+=("$game_name  →  $dir_name")
+        return
+    fi
 
     if $DRY_RUN; then
         process_installer_dry_run "$data_file" "$installer_slug" "$dir_name"
@@ -612,11 +834,24 @@ process_installer() {
     SUCCESS_INSTALLERS+=("$game_name  →  $dir_name$(${DRY_RUN} && echo '  [DRY-RUN]')")
 }
 
-# ── Single game processing ────────────────────────────────────────────────────
+# ── Per-game processing ───────────────────────────────────────────────────────
 process_game() {
     local game_name="$1"
-    local game_slug
+    local game_key
+    game_key=$(normalize_key "$game_name")
 
+    if ! $FORCE && ! $DRY_RUN; then
+        local cached_slug
+        cached_slug=$(py cache_get "$SLUG_CACHE_FILE" "$game_key" 2>/dev/null || true)
+        if [[ -n "$cached_slug" ]] \
+           && py cache_check "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR" 2>/dev/null; then
+            log_info "All installers cached → skipping API calls"
+            SKIPPED_GAMES+=("$game_name  [fully cached, use --force to refresh]")
+            return
+        fi
+    fi
+
+    local game_slug
     game_slug=$(resolve_game_slug "$game_name")
 
     if [[ "$game_slug" == "API_ERROR" ]]; then
@@ -639,7 +874,7 @@ process_game() {
     SLUG_SEEN["$game_slug"]=1
 
     local tmp_game
-    tmp_game=$(mktemp /tmp/lutris_XXXXXX.json)
+    tmp_game=$(mktemp /tmp/ottercache_XXXXXX.json)
     local http_code
     http_code=$(fetch_installer_data "$game_slug" "$tmp_game")
 
@@ -650,7 +885,7 @@ process_game() {
     fi
 
     local installers=()
-    mapfile -t installers < <(parse_installers "$tmp_game")
+    mapfile -t installers < <(py parse_installers "$tmp_game")
 
     if [[ "${#installers[@]}" -eq 0 ]]; then
         log_warn "No installers found → skipped"
@@ -659,11 +894,89 @@ process_game() {
     fi
 
     log_info "${#installers[@]} installer(s) found"
+
+    local installer_dirs=()
     for entry in "${installers[@]}"; do
+        local slug runner updated status
+        IFS=$'\t' read -r slug runner updated status <<< "$entry"
+        [[ -z "$slug" ]] && continue
+        installer_dirs+=("$(make_dir_name "$slug" "${updated:-0000-00-00}" "$runner" "$status")")
         process_installer "$tmp_game" "$entry" "$game_name"
     done
 
+    $DRY_RUN || py cache_update "$SLUG_CACHE_FILE" "$game_key" "$game_slug" "${installer_dirs[@]}" 2>/dev/null
+
     rm -f "$tmp_game"
+}
+
+# ── Prune old installer versions ──────────────────────────────────────────────
+prune_old_installer_dirs() {
+    $PRUNE_OLD || return
+
+    print_header "… Pruning old installer versions"
+
+    local outdated_json
+    outdated_json=$(py find_outdated "$OUTPUT_DIR")
+
+    if $DRY_RUN; then
+        local count=0
+        while IFS= read -r line; do
+            log_dryrun "$line"
+            count=$((count + 1))
+        done < <(py prune_preview "$outdated_json" 2>/dev/null || true)
+        [[ "$count" -eq 0 ]] && log_ok "No outdated versions found"
+        return
+    fi
+
+    mapfile -t PRUNED_DIRS < <(py prune_apply "$outdated_json" "$OUTPUT_DIR" 2>/dev/null || true)
+
+    if [[ "${#PRUNED_DIRS[@]}" -eq 0 ]]; then
+        log_ok "No outdated versions found"
+        return
+    fi
+
+    for dir_name in "${PRUNED_DIRS[@]}"; do
+        log_info "Removed: $dir_name"
+    done
+    log_ok "$count outdated installer versions removed"
+}
+
+# ── Offline localization ──────────────────────────────────────────────────────
+localize_installer_yaml() {
+    local yaml_file="$1" resource_dir="$2"
+    local offline_yaml="${yaml_file%.yaml}_offline.yaml"
+
+    local patched
+    patched=$(py localize_yaml "$yaml_file" "$resource_dir" "$offline_yaml" 2>/dev/null || true)
+
+    if [[ -f "$offline_yaml" ]]; then
+        log_ok "Offline YAML saved: $(basename "$offline_yaml")  (${patched:-0} URL(s) localized)"
+        LOCALIZED_YAMLS+=("$offline_yaml")
+    else
+        log_warn "Offline YAML generation failed: $(basename "$yaml_file")"
+    fi
+}
+
+localize_all_installers() {
+    print_header "3/4  Localize scripts for offline use"
+
+    local count=0 skipped=0
+    while IFS= read -r yaml_file; do
+        local resource_dir offline_yaml
+        resource_dir=$(dirname "$yaml_file")
+        offline_yaml="${yaml_file%.yaml}_offline.yaml"
+
+        if [[ -f "$offline_yaml" ]] && ! $FORCE; then
+            log_skip "Already localized: $(basename "$offline_yaml")"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        localize_installer_yaml "$yaml_file" "$resource_dir"
+        count=$((count + 1))
+    done < <(find "$OUTPUT_DIR" -maxdepth 2 -name "*.yaml" ! -name "*_offline.yaml" 2>/dev/null)
+
+    log_ok "$count scripts localized, $skipped already up to date"
 }
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -672,7 +985,7 @@ write_report() {
 
     cat << REPORT
 ${separator}
-  lutris-gog-fetch – Run Summary
+  ottercache – Run Summary
   Date     : $(date '+%Y-%m-%d %H:%M:%S')
   GOG dir  : $GOG_DIR
   Output   : $OUTPUT_DIR
@@ -681,6 +994,7 @@ ${separator}
 ── STATISTICS ──────────────────────────────────────────────────
   Games detected       : $TOTAL
   Installers backed up : ${#SUCCESS_INSTALLERS[@]}
+  Installers cached    : ${#CACHED_INSTALLERS[@]}
   Skipped              : ${#SKIPPED_GAMES[@]}
   Duplicate slugs      : ${#DUPLICATE_SLUGS[@]}
   Old versions pruned  : ${#PRUNED_DIRS[@]}
@@ -705,7 +1019,7 @@ REPORT
         echo ""
     }
     [[ "${#PRUNED_DIRS[@]}" -gt 0 ]] && {
-        echo "── PRUNED (outdated installer versions removed) ─────────────────"
+        echo "── PRUNED (outdated installer versions removed) ────────────────"
         printf '  ✂  %s\n' "${PRUNED_DIRS[@]}"
         echo ""
     }
@@ -724,114 +1038,8 @@ REPORT
     echo "${separator}"
 }
 
-# ── Prune old installer versions (optional) ───────────────────────────────────
-
-# Installer directories follow the pattern:
-#   <slug>_<YYYY-MM-DD>_<runner>_<status>
-#
-# This function groups all directories by their date-independent key
-# (<slug>_<runner>_<status>) and removes every version except the newest
-# within each group. Skipped entirely in --dry-run mode.
-prune_old_installer_dirs() {
-    $PRUNE_OLD || return
-
-    print_header "… Pruning old installer versions"
-    $DRY_RUN && { log_warn "Skipping prune in dry-run mode"; return; }
-
-    local pruned_json
-    pruned_json=$(python3 - "$OUTPUT_DIR" << 'PYEOF'
-import os, re, shutil, json, sys
-
-output_dir  = sys.argv[1]
-date_re     = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})_(.+)
-
-# Rewrites a Lutris YAML installer script so that all HTTP URLs in the
-# files: block are replaced with file:// URIs pointing to locally downloaded
-# resources. Produces a separate *_offline.yaml next to the original.
-localize_installer_yaml() {
-    local yaml_file="$1" resource_dir="$2"
-    local offline_yaml="${yaml_file%.yaml}_offline.yaml"
-
-    local patched
-    patched=$(python3 -c "
-import yaml, sys, os
-from urllib.parse import urlparse, unquote
-
-yaml_file, resource_dir, offline_yaml = sys.argv[1], sys.argv[2], sys.argv[3]
-
-try:
-    with open(yaml_file) as f:
-        data = yaml.safe_load(f)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr); sys.exit(1)
-
-files = data.get('script', {}).get('files', [])
-patched = 0
-
-for entry in files:
-    if not isinstance(entry, dict):
-        continue
-    for key, value in entry.items():
-        # Determine URL regardless of scalar or mapping form
-        if isinstance(value, str) and value.startswith('http'):
-            url = value
-        elif isinstance(value, dict) and str(value.get('url', '')).startswith('http'):
-            url = value['url']
-        else:
-            continue
-
-        fname = os.path.basename(unquote(urlparse(url).path))
-        local_path = os.path.join(resource_dir, fname)
-
-        if not os.path.exists(local_path):
-            continue  # resource missing – keep original URL
-
-        file_uri = 'file://' + os.path.abspath(local_path)
-        if isinstance(value, str):
-            entry[key] = file_uri
-        else:
-            value['url'] = file_uri
-        patched += 1
-
-with open(offline_yaml, 'w') as f:
-    yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-print(patched)
-" "$yaml_file" "$resource_dir" "$offline_yaml" 2>/dev/null || true)
-
-    if [[ -f "$offline_yaml" ]]; then
-        log_ok "Offline YAML saved: $(basename "$offline_yaml")  (${patched:-0} URL(s) localized)"
-        LOCALIZED_YAMLS+=("$offline_yaml")
-    else
-        log_warn "Offline YAML generation failed: $(basename "$yaml_file")"
-    fi
-}
-
-localize_all_installers() {
-    print_header "3/4  Localize scripts for offline use"
-
-    local count=0 skipped=0
-    while IFS= read -r yaml_file; do
-        local resource_dir offline_yaml
-        resource_dir=$(dirname "$yaml_file")
-        offline_yaml="${yaml_file%.yaml}_offline.yaml"
-
-        # Skip already localized scripts unless --force is set
-        if [[ -f "$offline_yaml" ]] && ! $FORCE; then
-            log_skip "Already localized: $(basename "$offline_yaml")"
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        localize_installer_yaml "$yaml_file" "$resource_dir"
-        count=$((count + 1))
-    done < <(find "$OUTPUT_DIR" -maxdepth 2 -name "*.yaml" ! -name "*_offline.yaml" 2>/dev/null)
-
-    log_ok "$count script(s) localized, $skipped already up to date"
-}
-
 print_summary() {
-    local report_file="$DIR_REPORTS/summary_${TIMESTAMP}.txt"
+    local report_file="$DIR_RUN/summary.txt"
     if $DRY_RUN; then
         write_report
     else
@@ -852,22 +1060,18 @@ main() {
     suppress_info_in_quiet_mode
     setup_output_dirs
     start_logging
+    setup_helper_python
+    trap cleanup_helper EXIT
 
-    print_header "lutris-gog-fetch"
+    print_header "ottercache"
     log_info "GOG directory : $GOG_DIR"
     log_info "Output target : $OUTPUT_DIR"
     $DRY_RUN      && log_warn "DRY-RUN active – no files will be written"
     $FORCE        && log_warn "FORCE active – existing files will be overwritten"
     $NO_RESOURCES && log_info "Scripts only – deeplink downloads skipped"
+    $PRUNE_OLD    && log_info "Outdated installer versions will be pruned"
 
     check_dependencies
-
-    declare -A GAMES=()
-    declare -A SLUG_SEEN=()
-    declare -a BROKEN_LINKS=() RESOURCE_ERRORS=() SKIPPED_GAMES=() \
-               DUPLICATE_SLUGS=() SUCCESS_INSTALLERS=() \
-               LOCALIZED_YAMLS=() PRUNED_DIRS=()
-
     detect_games
 
     print_header "2/4  Lutris scripts & resources"
@@ -880,182 +1084,6 @@ main() {
     done < <(printf '%s\n' "${!GAMES[@]}" | sort)
 
     prune_old_installer_dirs
-    $DRY_RUN || localize_all_installers
-
-    print_header "4/4  Summary"
-    print_summary
-}
-
-main "$@"
-)
-
-# Group directories by their date-independent key
-groups = {}
-for entry in os.scandir(output_dir):
-    if not entry.is_dir():
-        continue
-    m = date_re.match(entry.name)
-    if not m:
-        continue
-    prefix, date, suffix = m.groups()
-    key = f'{prefix}_{suffix}'
-    groups.setdefault(key, []).append((date, entry.name, entry.path))
-
-# Keep only the newest version per group; remove the rest
-pruned = []
-for versions in groups.values():
-    if len(versions) <= 1:
-        continue
-    versions.sort(key=lambda v: v[0], reverse=True)   # newest first
-    for _date, name, path in versions[1:]:
-        shutil.rmtree(path)
-        pruned.append(name)
-
-print(json.dumps(pruned))
-PYEOF
-    )
-
-    mapfile -t PRUNED_DIRS < <(
-        python3 -c "import json,sys; [print(d) for d in json.loads(sys.argv[1])]" \
-            "$pruned_json" 2>/dev/null || true
-    )
-
-    if [[ "${#PRUNED_DIRS[@]}" -eq 0 ]]; then
-        log_ok "No outdated versions found"
-        return
-    fi
-
-    for dir_name in "${PRUNED_DIRS[@]}"; do
-        log_info "Removed: $dir_name"
-    done
-    log_ok "${#PRUNED_DIRS[@]} outdated installer version(s) removed"
-}
-
-# ── Offline localization (Phase 3) ────────────────────────────────────────────
-
-# Rewrites a Lutris YAML installer script so that all HTTP URLs in the
-# files: block are replaced with file:// URIs pointing to locally downloaded
-# resources. Produces a separate *_offline.yaml next to the original.
-localize_installer_yaml() {
-    local yaml_file="$1" resource_dir="$2"
-    local offline_yaml="${yaml_file%.yaml}_offline.yaml"
-
-    local patched
-    patched=$(python3 -c "
-import yaml, sys, os
-from urllib.parse import urlparse, unquote
-
-yaml_file, resource_dir, offline_yaml = sys.argv[1], sys.argv[2], sys.argv[3]
-
-try:
-    with open(yaml_file) as f:
-        data = yaml.safe_load(f)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr); sys.exit(1)
-
-files = data.get('script', {}).get('files', [])
-patched = 0
-
-for entry in files:
-    if not isinstance(entry, dict):
-        continue
-    for key, value in entry.items():
-        # Determine URL regardless of scalar or mapping form
-        if isinstance(value, str) and value.startswith('http'):
-            url = value
-        elif isinstance(value, dict) and str(value.get('url', '')).startswith('http'):
-            url = value['url']
-        else:
-            continue
-
-        fname = os.path.basename(unquote(urlparse(url).path))
-        local_path = os.path.join(resource_dir, fname)
-
-        if not os.path.exists(local_path):
-            continue  # resource missing – keep original URL
-
-        file_uri = 'file://' + os.path.abspath(local_path)
-        if isinstance(value, str):
-            entry[key] = file_uri
-        else:
-            value['url'] = file_uri
-        patched += 1
-
-with open(offline_yaml, 'w') as f:
-    yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-print(patched)
-" "$yaml_file" "$resource_dir" "$offline_yaml" 2>/dev/null || true)
-
-    if [[ -f "$offline_yaml" ]]; then
-        log_ok "Offline YAML saved: $(basename "$offline_yaml")  (${patched:-0} URL(s) localized)"
-        LOCALIZED_YAMLS+=("$offline_yaml")
-    else
-        log_warn "Offline YAML generation failed: $(basename "$yaml_file")"
-    fi
-}
-
-localize_all_installers() {
-    print_header "3/4  Localize scripts for offline use"
-
-    local count=0
-    while IFS= read -r yaml_file; do
-        local resource_dir
-        resource_dir=$(dirname "$yaml_file")
-        localize_installer_yaml "$yaml_file" "$resource_dir"
-        count=$((count + 1))
-    done < <(find "$OUTPUT_DIR" -maxdepth 2 -name "*.yaml" ! -name "*_offline.yaml" 2>/dev/null)
-
-    log_ok "$count installer script(s) localized"
-}
-
-print_summary() {
-    local report_file="$DIR_REPORTS/summary_${TIMESTAMP}.txt"
-    if $DRY_RUN; then
-        write_report
-    else
-        write_report | tee "$report_file"
-        echo ""
-        log_ok "Report saved: $report_file"
-    fi
-
-    echo ""
-    [[ "${#BROKEN_LINKS[@]}" -gt 0 ]] && log_warn "${#BROKEN_LINKS[@]} broken link(s) – see report for details"
-    log_ok "Done  |  Total size: $(du -sh "$OUTPUT_DIR" 2>/dev/null | cut -f1 || echo '?')"
-    $DRY_RUN && log_warn "DRY-RUN: no files were written"
-}
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-main() {
-    parse_args "$@"
-    suppress_info_in_quiet_mode
-    setup_output_dirs
-    start_logging
-
-    print_header "lutris-gog-fetch"
-    log_info "GOG directory : $GOG_DIR"
-    log_info "Output target : $OUTPUT_DIR"
-    $DRY_RUN      && log_warn "DRY-RUN active – no files will be written"
-    $FORCE        && log_warn "FORCE active – existing files will be overwritten"
-    $NO_RESOURCES && log_info "Scripts only – deeplink downloads skipped"
-
-    check_dependencies
-
-    declare -A GAMES=()
-    declare -A SLUG_SEEN=()
-    declare -a BROKEN_LINKS=() RESOURCE_ERRORS=() SKIPPED_GAMES=() DUPLICATE_SLUGS=() SUCCESS_INSTALLERS=() LOCALIZED_YAMLS=()
-
-    detect_games
-
-    print_header "2/4  Lutris scripts & resources"
-    local game_num=0
-    while IFS= read -r key; do
-        game_num=$((game_num + 1))
-        print_section "[$game_num/$TOTAL] ${GAMES[$key]}"
-        process_game "${GAMES[$key]}"
-        sleep "$API_DELAY"
-    done < <(printf '%s\n' "${!GAMES[@]}" | sort)
-
     $DRY_RUN || localize_all_installers
 
     print_header "4/4  Summary"
