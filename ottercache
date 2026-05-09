@@ -32,17 +32,6 @@
 #
 # Note: --save-product-json is required, as ottercache relies on the generated
 # product_*.json files as its primary game detection source.
-#
-# Concurrency: ottercache reads/writes reports/slug_cache.json without
-# locking. Running multiple instances against the same --output-dir
-# concurrently can corrupt the cache file. Run only one instance at a time
-# per output directory.
-#
-# YAML auto-repair: ottercache detects installer YAMLs from older versions
-# that lack the Lutris top-level fields (name, game_slug, version, slug,
-# runner) and rewrites them on the next run. Downloaded resources are kept
-# untouched. Affected installers are listed in the run report under
-# "REPAIRED". This is a one-time migration; subsequent runs hit cache.
 # =============================================================================
 set -uo pipefail
 
@@ -81,7 +70,6 @@ declare -a SKIPPED_GAMES=()
 declare -a DUPLICATE_SLUGS=()
 declare -a SUCCESS_INSTALLERS=()
 declare -a CACHED_INSTALLERS=()
-declare -a REPAIRED_INSTALLERS=()
 declare -a LOCALIZED_YAMLS=()
 declare -a PRUNED_DIRS=()
 
@@ -109,12 +97,6 @@ import re
 import shutil
 import sys
 import urllib.parse
-
-
-# Lutris installer top-level fields that must be present for the client
-# to display the install dialog and run the installer. See:
-# https://github.com/lutris/lutris/blob/master/docs/installers.rst#basics
-LUTRIS_REQUIRED_FIELDS = ('name', 'game_slug', 'slug', 'runner')
 
 
 def cmd_url_to_filename():
@@ -256,176 +238,17 @@ def cmd_save_installer_json():
 
 
 def cmd_save_installer_yaml():
-    """
-    Write a Lutris-spec-compliant installer YAML.
-
-    The Lutris API returns the installer's `content` field as the body of the
-    YAML's `script:` section only — the surrounding required top-level fields
-    (name, game_slug, version, slug, runner) live as separate fields on the
-    installer object. Earlier ottercache versions wrote `content` verbatim,
-    which produced YAMLs that Lutris could parse but not display correctly:
-    the install dialog would show the literal string "game_slug" instead of
-    the game name, and installation would fail.
-
-    This implementation rebuilds the full document by:
-      1. Parsing `content` as YAML.
-      2. Treating it as either the full document (if `script` is at root)
-         or as the script body (otherwise).
-      3. Adding the required top-level fields from the installer object.
-      4. Forcing string type on these fields to avoid YAML number-coercion
-         (Lutris issue #4365: e.g. version "012" parsed as octal 10).
-      5. Validating that all required fields are populated before writing.
-    """
-    try:
-        import yaml
-    except ImportError:
-        print('ERROR: python3-yaml not installed', file=sys.stderr)
-        sys.exit(1)
-
     target_slug = sys.argv[3]
     dest_file = sys.argv[4]
-
-    try:
-        data = json.load(open(sys.argv[2]))
-    except Exception as e:
-        print('ERROR: cannot read installer JSON: ' + str(e), file=sys.stderr)
-        sys.exit(1)
-
+    data = json.load(open(sys.argv[2]))
     for inst in data.get('installers', []):
         if inst.get('slug') != target_slug:
             continue
-
         content = inst.get('content', '')
-        try:
-            parsed = yaml.safe_load(content) if content else {}
-        except Exception as e:
-            print('ERROR: invalid YAML in API content: ' + str(e), file=sys.stderr)
-            sys.exit(1)
-
-        if isinstance(parsed, dict) and 'script' in parsed:
-            full = parsed
-        else:
-            full = {'script': parsed if isinstance(parsed, dict) else {}}
-
-        for field in ('name', 'game_slug', 'version', 'slug', 'runner'):
-            value = inst.get(field)
-            if value is not None:
-                full[field] = str(value)
-
-        for field in ('description', 'notes', 'year', 'steamid',
-                      'gogid', 'humbleid', 'humblestoreid', 'gogslug',
-                      'installer_slug'):
-            if inst.get(field) not in (None, ''):
-                full[field] = inst[field]
-
-        missing = [f for f in LUTRIS_REQUIRED_FIELDS if not full.get(f)]
-        if missing:
-            print('ERROR: installer ' + target_slug
-                  + ' missing required fields: ' + ', '.join(missing),
-                  file=sys.stderr)
-            sys.exit(1)
-
-        with open(dest_file, 'w') as f:
-            yaml.dump(full, f, default_flow_style=False,
-                      allow_unicode=True, sort_keys=False)
-        return
-
-    print('ERROR: installer slug not found: ' + target_slug, file=sys.stderr)
-    sys.exit(1)
-
-
-def cmd_yaml_has_required_fields():
-    """
-    Validate a Lutris installer YAML.
-
-    Exit codes:
-      0 = file exists, is valid YAML, and has all Lutris top-level fields
-      1 = file exists but is missing fields, malformed, or not a mapping
-      2 = file does not exist or python3-yaml is unavailable
-    """
-    try:
-        import yaml
-    except ImportError:
-        sys.exit(2)
-    yaml_file = sys.argv[2]
-    if not os.path.exists(yaml_file):
-        sys.exit(2)
-    try:
-        with open(yaml_file) as f:
-            data = yaml.safe_load(f)
-    except Exception:
-        sys.exit(1)
-    if not isinstance(data, dict):
-        sys.exit(1)
-    sys.exit(0 if all(data.get(k) for k in LUTRIS_REQUIRED_FIELDS) else 1)
-
-
-def cmd_cache_validate_yamls():
-    """
-    Validate that every cached installer directory contains a YAML with the
-    Lutris top-level fields. Used as a second-stage cache check after
-    cache_check confirms directory existence.
-
-    Exit codes:
-      0 = all YAMLs valid
-      1 = at least one YAML missing or invalid (triggers repair on next run)
-    """
-    try:
-        import yaml
-    except ImportError:
-        sys.exit(1)
-
-    cache_file = sys.argv[2]
-    key = sys.argv[3]
-    outdir = sys.argv[4]
-
-    try:
-        data = json.load(open(cache_file))
-    except Exception:
-        sys.exit(1)
-
-    dirs = data.get(key, {}).get('dirs', [])
-    if not dirs:
-        sys.exit(1)
-
-    for d in dirs:
-        full_path = os.path.join(outdir, d)
-        if not os.path.isdir(full_path):
-            sys.exit(1)
-
-        source_yaml = None
-        for fname in os.listdir(full_path):
-            if fname.endswith('.yaml') and not fname.endswith('_offline.yaml'):
-                source_yaml = os.path.join(full_path, fname)
-                break
-
-        if source_yaml is None:
-            sys.exit(1)
-
-        try:
-            with open(source_yaml) as f:
-                ydata = yaml.safe_load(f)
-        except Exception:
-            sys.exit(1)
-
-        if not isinstance(ydata, dict) \
-           or not all(ydata.get(k) for k in LUTRIS_REQUIRED_FIELDS):
-            sys.exit(1)
-
-    sys.exit(0)
-
-
-def cmd_save_installer_yaml_legacy_unused():
-    # Kept name-spaced to avoid accidental dispatch; see cmd_save_installer_yaml.
-    pass
-
-
-def cmd_save_installer_yaml_compat():
-    pass
-
-
-def cmd_save_installer_yaml_old():
-    pass
+        if content:
+            with open(dest_file, 'w') as f:
+                f.write(content)
+        break
 
 
 def cmd_cache_get():
@@ -524,18 +347,6 @@ def cmd_localize_yaml():
         print('ERROR: ' + str(e), file=sys.stderr)
         sys.exit(1)
 
-    if not isinstance(data, dict):
-        print('ERROR: source YAML is not a mapping', file=sys.stderr)
-        sys.exit(1)
-
-    # Refuse to write a localized copy of a broken source YAML; the caller
-    # should repair the source first via the normal fetch path.
-    missing = [k for k in LUTRIS_REQUIRED_FIELDS if not data.get(k)]
-    if missing:
-        print('ERROR: source YAML missing required fields: '
-              + ', '.join(missing), file=sys.stderr)
-        sys.exit(1)
-
     files = data.get('script', {}).get('files', [])
     patched = 0
 
@@ -570,26 +381,24 @@ def cmd_localize_yaml():
 
 
 COMMANDS = {
-    'url_to_filename':         cmd_url_to_filename,
-    'product_title':           cmd_product_title,
-    'slug_candidates':         cmd_slug_candidates,
-    'search_names':            cmd_search_names,
-    'has_game_id':             cmd_has_game_id,
-    'url_encode':              cmd_url_encode,
-    'find_slug_in_results':    cmd_find_slug_in_results,
-    'parse_installers':        cmd_parse_installers,
-    'extract_urls':            cmd_extract_urls,
-    'save_installer_json':     cmd_save_installer_json,
-    'save_installer_yaml':     cmd_save_installer_yaml,
-    'yaml_has_required_fields': cmd_yaml_has_required_fields,
-    'cache_get':               cmd_cache_get,
-    'cache_check':             cmd_cache_check,
-    'cache_validate_yamls':    cmd_cache_validate_yamls,
-    'cache_update':            cmd_cache_update,
-    'find_outdated':           cmd_find_outdated,
-    'prune_preview':           cmd_prune_preview,
-    'prune_apply':             cmd_prune_apply,
-    'localize_yaml':           cmd_localize_yaml,
+    'url_to_filename':       cmd_url_to_filename,
+    'product_title':         cmd_product_title,
+    'slug_candidates':       cmd_slug_candidates,
+    'search_names':          cmd_search_names,
+    'has_game_id':           cmd_has_game_id,
+    'url_encode':            cmd_url_encode,
+    'find_slug_in_results':  cmd_find_slug_in_results,
+    'parse_installers':      cmd_parse_installers,
+    'extract_urls':          cmd_extract_urls,
+    'save_installer_json':   cmd_save_installer_json,
+    'save_installer_yaml':   cmd_save_installer_yaml,
+    'cache_get':             cmd_cache_get,
+    'cache_check':           cmd_cache_check,
+    'cache_update':          cmd_cache_update,
+    'find_outdated':         cmd_find_outdated,
+    'prune_preview':         cmd_prune_preview,
+    'prune_apply':           cmd_prune_apply,
+    'localize_yaml':         cmd_localize_yaml,
 }
 
 if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
@@ -623,14 +432,6 @@ ${BOLD}OPTIONS:${NC}
       --prune-old            Remove outdated installer versions after fetching
       --api-delay  <sec>     Pause between API requests (default: 1)
   -h, --help                 Show this help
-
-${BOLD}NOTES:${NC}
-  Run only one ottercache instance per --output-dir at a time; the slug
-  cache is not lock-protected.
-
-  Installer YAMLs from older ottercache versions (missing Lutris top-level
-  fields) are auto-repaired on the next regular run. Cached resources are
-  preserved during repair.
 
 EOF
 }
@@ -704,15 +505,9 @@ check_dependencies() {
             missing=$((missing + 1))
         fi
     done
-    # python3-yaml is required: every installer YAML is now built by the
-    # helper which uses yaml.dump, and validation needs yaml.safe_load.
-    if python3 -c "import yaml" 2>/dev/null; then
-        log_ok "python3-yaml available"
-    else
-        log_error "python3-yaml not found – required for installer script processing"
-        log_error "Install with: sudo apt install python3-yaml  (or pip install pyyaml)"
-        missing=$((missing + 1))
-    fi
+    python3 -c "import yaml" 2>/dev/null \
+        && log_ok "python3-yaml available" \
+        || log_warn "python3-yaml not found – offline localization disabled"
     [[ "$missing" -gt 0 ]] && { log_error "Missing required dependencies"; exit 1; }
 }
 
@@ -750,28 +545,6 @@ check_url_status() {
 
 is_http_success() {
     case "$1" in 200|206|301|302) return 0 ;; *) return 1 ;; esac
-}
-
-# ── YAML validation helpers ───────────────────────────────────────────────────
-# Returns 0 if the YAML at $1 has all Lutris-required top-level fields,
-# non-zero otherwise. A missing file counts as non-zero so callers can
-# treat "missing or broken" as a single repair condition.
-yaml_has_required_fields() {
-    [[ -f "$1" ]] || return 2
-    py yaml_has_required_fields "$1"
-}
-
-# Returns 0 (true) when the offline YAML must be (re)generated:
-#   - it does not exist
-#   - the source YAML has been modified more recently than the offline copy
-#   - the offline copy is missing required Lutris top-level fields
-# Returns 1 (false) when the offline YAML can be left alone.
-needs_localize_regen() {
-    local source_yaml="$1" offline_yaml="$2"
-    [[ -f "$offline_yaml" ]] || return 0
-    [[ "$source_yaml" -nt "$offline_yaml" ]] && return 0
-    yaml_has_required_fields "$offline_yaml" || return 0
-    return 1
 }
 
 # ── Game detection ────────────────────────────────────────────────────────────
@@ -1029,11 +802,8 @@ process_installer_real() {
 
     mkdir -p "$inst_dir"
     py save_installer_json "$data_file" "$installer_slug" "$inst_dir" 2>/dev/null
-    if py save_installer_yaml "$data_file" "$installer_slug" "$inst_dir/${safe_slug}.yaml"; then
-        log_ok "YAML saved: ${safe_slug}.yaml"
-    else
-        log_error "Failed to write YAML for $installer_slug"
-    fi
+    py save_installer_yaml "$data_file" "$installer_slug" "$inst_dir/${safe_slug}.yaml" 2>/dev/null
+    [[ -f "$inst_dir/${safe_slug}.yaml" ]] && log_ok "YAML saved: ${safe_slug}.yaml"
 
     $NO_RESOURCES || download_resources "$data_file" "$installer_slug" "$inst_dir" "$dir_name"
 }
@@ -1054,23 +824,9 @@ process_installer() {
     log_info "Folder    : $dir_name"
 
     if [[ -d "$inst_dir" ]] && ! $FORCE; then
-        local safe_slug existing_yaml
-        safe_slug=$(to_safe_name "$installer_slug")
-        existing_yaml="$inst_dir/${safe_slug}.yaml"
-
-        if yaml_has_required_fields "$existing_yaml"; then
-            log_skip "Already cached – skipping"
-            CACHED_INSTALLERS+=("$game_name  →  $dir_name")
-            return
-        fi
-
-        # Legacy YAML format from an older ottercache run (missing Lutris
-        # top-level fields). Re-fetch script + JSON and rewrite the YAML;
-        # downloaded resources stay in place because download_resource
-        # already skips files that exist locally.
-        log_warn "Cached YAML missing required fields → repairing scripts"
-        REPAIRED_INSTALLERS+=("$game_name  →  $dir_name")
-        # Fall through to process_installer_real / _dry_run.
+        log_skip "Already cached – skipping"
+        CACHED_INSTALLERS+=("$game_name  →  $dir_name")
+        return
     fi
 
     if $DRY_RUN; then
@@ -1093,15 +849,9 @@ process_game() {
         cached_slug=$(py cache_get "$SLUG_CACHE_FILE" "$game_key" 2>/dev/null || true)
         if [[ -n "$cached_slug" ]] \
            && py cache_check "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR" 2>/dev/null; then
-            if py cache_validate_yamls "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR" 2>/dev/null; then
-                log_info "All installers cached → skipping API calls"
-                SKIPPED_GAMES+=("$game_name  [fully cached, use --force to refresh]")
-                return
-            fi
-            # Directories present but at least one YAML uses the legacy
-            # format. Fall through to the API fetch; process_installer
-            # will detect and repair each affected YAML.
-            log_warn "Cached YAMLs need repair → fetching scripts (resources kept)"
+            log_info "All installers cached → skipping API calls"
+            SKIPPED_GAMES+=("$game_name  [fully cached, use --force to refresh]")
+            return
         fi
     fi
 
@@ -1220,7 +970,7 @@ localize_all_installers() {
         resource_dir=$(dirname "$yaml_file")
         offline_yaml="${yaml_file%.yaml}_offline.yaml"
 
-        if ! $FORCE && ! needs_localize_regen "$yaml_file" "$offline_yaml"; then
+        if [[ -f "$offline_yaml" ]] && ! $FORCE; then
             log_skip "Already localized: $(basename "$offline_yaml")"
             skipped=$((skipped + 1))
             continue
@@ -1249,7 +999,6 @@ ${separator}
   Games detected       : $TOTAL
   Installers backed up : ${#SUCCESS_INSTALLERS[@]}
   Installers cached    : ${#CACHED_INSTALLERS[@]}
-  Installers repaired  : ${#REPAIRED_INSTALLERS[@]}
   Skipped              : ${#SKIPPED_GAMES[@]}
   Duplicate slugs      : ${#DUPLICATE_SLUGS[@]}
   Old versions pruned  : ${#PRUNED_DIRS[@]}
@@ -1261,11 +1010,6 @@ REPORT
     [[ "${#SUCCESS_INSTALLERS[@]}" -gt 0 ]] && {
         echo "── BACKED UP INSTALLERS ────────────────────────────────────────"
         printf '  ✔  %s\n' "${SUCCESS_INSTALLERS[@]}"
-        echo ""
-    }
-    [[ "${#REPAIRED_INSTALLERS[@]}" -gt 0 ]] && {
-        echo "── REPAIRED (legacy YAMLs migrated to current format) ──────────"
-        printf '  ↻  %s\n' "${REPAIRED_INSTALLERS[@]}"
         echo ""
     }
     [[ "${#SKIPPED_GAMES[@]}" -gt 0 ]] && {
@@ -1342,11 +1086,6 @@ main() {
         process_game "${GAMES[$key]}"
         sleep "$API_DELAY"
     done < <(printf '%s\n' "${!GAMES[@]}" | sort)
-
-    if [[ "${#REPAIRED_INSTALLERS[@]}" -gt 0 ]]; then
-        log_warn "${#REPAIRED_INSTALLERS[@]} installer(s) had legacy YAML format and were repaired"
-        log_warn "This is a one-time migration after upgrading ottercache; future runs will hit cache"
-    fi
 
     prune_old_installer_dirs
     $DRY_RUN || localize_all_installers
