@@ -32,6 +32,16 @@
 #
 # Note: --save-product-json is required, as ottercache relies on the generated
 # product_*.json files as its primary game detection source.
+#
+# Concurrency: ottercache acquires an exclusive flock on
+# <output_dir>/reports/.ottercache.lock. Running a second instance against the
+# same --output-dir will fail fast with an explanatory error. Use separate
+# output directories for parallel runs.
+#
+# Required dependencies: bash 4+, curl, python3 (3.6+), PyYAML (python3-yaml),
+# flock (util-linux), GNU coreutils. PyYAML is required even without
+# --no-resources, because installer YAML generation now structures top-level
+# fields (name, game_slug, version, slug, runner) per Lutris spec.
 # =============================================================================
 set -uo pipefail
 
@@ -72,6 +82,9 @@ declare -a SUCCESS_INSTALLERS=()
 declare -a CACHED_INSTALLERS=()
 declare -a LOCALIZED_YAMLS=()
 declare -a PRUNED_DIRS=()
+declare -a YAML_GENERATION_FAILURES=()
+declare -i API_ERROR_COUNT=0
+declare -i HELPER_ERROR_COUNT=0
 
 GOG_DIR=""
 OUTPUT_DIR=""
@@ -80,12 +93,16 @@ FORCE=false
 QUIET=false
 NO_RESOURCES=false
 PRUNE_OLD=false
+PRUNE_ANYWAY=false
 API_DELAY=1
 TIMESTAMP=""
 DIR_REPORTS=""
 DIR_RUN=""
 HELPER_PY=""
+PY_ERROR_LOG=""
 SLUG_CACHE_FILE=""
+LOCK_FILE=""
+LOCK_FD=""
 TOTAL=0
 
 # ── Python helper script (written once at startup, all Python lives here) ────
@@ -99,6 +116,12 @@ import sys
 import urllib.parse
 
 
+def err(msg):
+    """Log to stderr and exit non-zero."""
+    print('PY_ERROR ' + sys.argv[1] + ': ' + msg, file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_url_to_filename():
     url = sys.argv[2]
     p = urllib.parse.urlparse(url)
@@ -108,10 +131,13 @@ def cmd_url_to_filename():
 
 def cmd_product_title():
     try:
-        d = json.load(open(sys.argv[2]))
+        with open(sys.argv[2]) as f:
+            d = json.load(f)
         print(d.get('title', '').strip())
-    except Exception:
-        pass
+    except json.JSONDecodeError as e:
+        err('invalid JSON in ' + sys.argv[2] + ': ' + str(e))
+    except Exception as e:
+        err('cannot read ' + sys.argv[2] + ': ' + str(e))
 
 
 def cmd_slug_candidates():
@@ -152,15 +178,29 @@ def cmd_search_names():
 
 
 def cmd_has_game_id():
+    """Boolean check: exit 0 if installer has an 'id' field, else exit 1.
+    Errors during read also return exit 1 (treated as 'no'), but log to stderr."""
     try:
-        d = json.load(open(sys.argv[2]))
+        with open(sys.argv[2]) as f:
+            d = json.load(f)
         sys.exit(0 if d.get('id') else 1)
-    except Exception:
+    except Exception as e:
+        print('PY_WARN has_game_id: ' + str(e), file=sys.stderr)
         sys.exit(1)
 
 
 def cmd_url_encode():
     print(urllib.parse.quote(sys.argv[2]))
+
+
+def cmd_extract_gog_id():
+    """Replacement for grep -P. Extracts a 9-10 digit GOG ID surrounded by
+    word boundaries or common separator characters."""
+    filename = sys.argv[2]
+    pattern = r'(?:^|[\[(\s_.\-])(\d{9,10})(?:[\])\s_.\-]|$)'
+    m = re.search(pattern, filename)
+    if m:
+        print(m.group(1))
 
 
 def cmd_find_slug_in_results():
@@ -171,97 +211,182 @@ def cmd_find_slug_in_results():
     query_noyear_name = re.sub(r'\s*\(\d{4}\)\s*$', '', query).strip()
 
     try:
-        results = json.load(open(results_file)).get('results', [])
-        if not results:
-            sys.exit(1)
-        checks = [
-            lambda r: r.get('slug') == query_slug,
-            lambda r: r.get('slug') == query_noyear,
-            lambda r: r.get('name', '').lower().strip() == query,
-            lambda r: r.get('name', '').lower().strip() == query_noyear_name,
-            lambda r: r.get('slug', '').startswith(query_noyear),
-        ]
-        for check in checks:
-            for r in results:
-                if check(r):
-                    print(r['slug'])
-                    sys.exit(0)
-        print(results[0].get('slug', ''))
-    except Exception:
+        with open(results_file) as f:
+            results = json.load(f).get('results', [])
+    except Exception as e:
+        err('cannot read ' + results_file + ': ' + str(e))
+
+    if not results:
         sys.exit(1)
+
+    checks = [
+        lambda r: r.get('slug') == query_slug,
+        lambda r: r.get('slug') == query_noyear,
+        lambda r: r.get('name', '').lower().strip() == query,
+        lambda r: r.get('name', '').lower().strip() == query_noyear_name,
+        lambda r: r.get('slug', '').startswith(query_noyear),
+    ]
+    for check in checks:
+        for r in results:
+            if check(r):
+                print(r['slug'])
+                sys.exit(0)
+    print(results[0].get('slug', ''))
 
 
 def cmd_parse_installers():
     try:
-        data = json.load(open(sys.argv[2]))
-        for inst in data.get('installers', []):
-            slug = inst.get('slug', '')
-            runner = inst.get('runner', 'unknown')
-            updated = (inst.get('updated_at') or inst.get('created_at') or '')[:10]
-            status = 'published' if inst.get('published', False) else 'unpublished'
-            if slug:
-                print(slug + '\t' + runner + '\t' + updated + '\t' + status)
-    except Exception:
-        pass
+        with open(sys.argv[2]) as f:
+            data = json.load(f)
+    except Exception as e:
+        err('cannot read ' + sys.argv[2] + ': ' + str(e))
+
+    for inst in data.get('installers', []):
+        slug = inst.get('slug', '')
+        runner = inst.get('runner', 'unknown')
+        updated = (inst.get('updated_at') or inst.get('created_at') or '')[:10]
+        status = 'published' if inst.get('published', False) else 'unpublished'
+        if slug:
+            print(slug + '\t' + runner + '\t' + updated + '\t' + status)
 
 
 def cmd_extract_urls():
     target_slug = sys.argv[3]
     try:
-        data = json.load(open(sys.argv[2]))
-        for inst in data.get('installers', []):
-            if inst.get('slug') != target_slug:
+        with open(sys.argv[2]) as f:
+            data = json.load(f)
+    except Exception as e:
+        err('cannot read ' + sys.argv[2] + ': ' + str(e))
+
+    for inst in data.get('installers', []):
+        if inst.get('slug') != target_slug:
+            continue
+        for f in inst.get('script', {}).get('files', []):
+            if not isinstance(f, dict):
                 continue
-            for f in inst.get('script', {}).get('files', []):
-                if not isinstance(f, dict):
-                    continue
-                for k, v in f.items():
-                    if isinstance(v, str) and v.startswith('http'):
-                        print(v)
-                    elif isinstance(v, dict) and 'url' in v:
-                        print(v['url'])
-    except Exception:
-        pass
+            for k, v in f.items():
+                if isinstance(v, str) and v.startswith('http'):
+                    print(v)
+                elif isinstance(v, dict) and 'url' in v:
+                    print(v['url'])
 
 
 def cmd_save_installer_json():
     target_slug = sys.argv[3]
     dest_dir = sys.argv[4]
-    data = json.load(open(sys.argv[2]))
+    try:
+        with open(sys.argv[2]) as f:
+            data = json.load(f)
+    except Exception as e:
+        err('cannot read ' + sys.argv[2] + ': ' + str(e))
+
     for inst in data.get('installers', []):
         if inst.get('slug') != target_slug:
             continue
         fname = re.sub(r'[^\w\-.]', '_', target_slug) + '.json'
-        with open(os.path.join(dest_dir, fname), 'w') as f:
-            json.dump(inst, f, indent=2, ensure_ascii=False)
-        break
+        try:
+            with open(os.path.join(dest_dir, fname), 'w') as f:
+                json.dump(inst, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            err('cannot write JSON to ' + dest_dir + ': ' + str(e))
+        return
+
+    err('installer slug not found in API response: ' + target_slug)
 
 
 def cmd_save_installer_yaml():
+    """Generate a fully-spec-compliant Lutris installer YAML.
+
+    The Lutris API returns 'content' as the script body only (the part an
+    author edits on the website). Lutris itself requires top-level fields
+    (name, game_slug, version, slug, runner) per docs/installers.rst.
+    Without them, the installer dialog displays 'game_slug' as a fallback
+    title and refuses to install.
+
+    We always overwrite top-level fields with API metadata (source of truth)
+    and force string types to avoid YAML number coercion (Lutris issue #4365:
+    a 'version: 012' line is parsed as octal 10 and locks the dialog).
+    """
+    try:
+        import yaml
+    except ImportError:
+        err('python3-yaml not installed (required for YAML generation)')
+
     target_slug = sys.argv[3]
     dest_file = sys.argv[4]
-    data = json.load(open(sys.argv[2]))
+
+    try:
+        with open(sys.argv[2]) as f:
+            data = json.load(f)
+    except Exception as e:
+        err('cannot read installer JSON: ' + str(e))
+
     for inst in data.get('installers', []):
         if inst.get('slug') != target_slug:
             continue
+
         content = inst.get('content', '')
-        if content:
+        try:
+            parsed = yaml.safe_load(content) if content else {}
+        except yaml.YAMLError as e:
+            err('invalid YAML in API content: ' + str(e))
+
+        # Heuristic: if the parsed content already exposes a 'script' key at
+        # the top level, the API delivered a full document. Otherwise treat
+        # the parsed content as the script body itself.
+        if isinstance(parsed, dict) and 'script' in parsed:
+            full = parsed
+        else:
+            full = {'script': parsed if isinstance(parsed, dict) else {}}
+
+        # Required top-level fields per Lutris installer spec.
+        # Force string type to defeat YAML scalar inference.
+        for field in ('name', 'game_slug', 'version', 'slug', 'runner'):
+            value = inst.get(field)
+            if value is not None:
+                full[field] = str(value)
+
+        # Optional but spec-compliant metadata, preserved if present.
+        for field in ('description', 'notes', 'year', 'steamid', 'gogid',
+                      'humbleid', 'humblestoreid', 'gogslug', 'installer_slug'):
+            v = inst.get(field)
+            if v not in (None, ''):
+                full[field] = v
+
+        # Sanity check: refuse to write a useless YAML.
+        missing = [f for f in ('name', 'game_slug', 'slug', 'runner')
+                   if not full.get(f)]
+        if missing:
+            err('installer ' + target_slug + ' missing required fields: '
+                + ', '.join(missing))
+
+        try:
             with open(dest_file, 'w') as f:
-                f.write(content)
-        break
+                yaml.dump(full, f, default_flow_style=False,
+                          allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            err('cannot write YAML to ' + dest_file + ': ' + str(e))
+        return
+
+    err('installer slug not found in API response: ' + target_slug)
 
 
 def cmd_cache_get():
     try:
-        data = json.load(open(sys.argv[2]))
+        with open(sys.argv[2]) as f:
+            data = json.load(f)
         print(data.get(sys.argv[3], {}).get('slug', ''))
-    except Exception:
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        err('cannot read cache ' + sys.argv[2] + ': ' + str(e))
 
 
 def cmd_cache_check():
+    """Boolean check: exit 0 if all cached dirs exist, else exit 1."""
     try:
-        data = json.load(open(sys.argv[2]))
+        with open(sys.argv[2]) as f:
+            data = json.load(f)
         dirs = data.get(sys.argv[3], {}).get('dirs', [])
         outdir = sys.argv[4]
         if not dirs:
@@ -270,7 +395,8 @@ def cmd_cache_check():
             if not os.path.isdir(os.path.join(outdir, d)):
                 sys.exit(1)
         sys.exit(0)
-    except Exception:
+    except Exception as e:
+        print('PY_WARN cache_check: ' + str(e), file=sys.stderr)
         sys.exit(1)
 
 
@@ -280,27 +406,38 @@ def cmd_cache_update():
     slug = sys.argv[4]
     dirs = sys.argv[5:]
     try:
-        data = json.load(open(cache_file))
-    except Exception:
+        with open(cache_file) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
         data = {}
+    except Exception as e:
+        err('cannot read cache ' + cache_file + ': ' + str(e))
+
     data[key] = {'slug': slug, 'dirs': dirs}
-    with open(cache_file, 'w') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        err('cannot write cache ' + cache_file + ': ' + str(e))
 
 
 def cmd_find_outdated():
     output_dir = sys.argv[2]
     date_re = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})_(.+)$')
     groups = {}
-    for entry in os.scandir(output_dir):
-        if not entry.is_dir():
-            continue
-        m = date_re.match(entry.name)
-        if not m:
-            continue
-        prefix, date, suffix = m.groups()
-        key = prefix + '_' + suffix
-        groups.setdefault(key, []).append((date, entry.name))
+    try:
+        for entry in os.scandir(output_dir):
+            if not entry.is_dir():
+                continue
+            m = date_re.match(entry.name)
+            if not m:
+                continue
+            prefix, date, suffix = m.groups()
+            key = prefix + '_' + suffix
+            groups.setdefault(key, []).append((date, entry.name))
+    except Exception as e:
+        err('cannot scan ' + output_dir + ': ' + str(e))
+
     result = {}
     for key, versions in groups.items():
         if len(versions) <= 1:
@@ -314,27 +451,37 @@ def cmd_find_outdated():
 
 
 def cmd_prune_preview():
-    data = json.loads(sys.argv[2])
+    try:
+        data = json.loads(sys.argv[2])
+    except json.JSONDecodeError as e:
+        err('invalid prune data JSON: ' + str(e))
     for info in data.values():
         for old in info['remove']:
             print(old + '  ->  would be replaced by  ->  ' + info['keep'])
 
 
 def cmd_prune_apply():
-    data = json.loads(sys.argv[2])
+    try:
+        data = json.loads(sys.argv[2])
+    except json.JSONDecodeError as e:
+        err('invalid prune data JSON: ' + str(e))
+
     outdir = sys.argv[3]
     for info in data.values():
         for old in info['remove']:
-            shutil.rmtree(os.path.join(outdir, old))
-            print(old)
+            try:
+                shutil.rmtree(os.path.join(outdir, old))
+                print(old)
+            except Exception as e:
+                print('PY_WARN prune_apply ' + old + ': ' + str(e),
+                      file=sys.stderr)
 
 
 def cmd_localize_yaml():
     try:
         import yaml
     except ImportError:
-        print('ERROR: python3-yaml not installed', file=sys.stderr)
-        sys.exit(1)
+        err('python3-yaml not installed')
 
     yaml_file = sys.argv[2]
     resource_dir = sys.argv[3]
@@ -344,8 +491,15 @@ def cmd_localize_yaml():
         with open(yaml_file) as f:
             data = yaml.safe_load(f)
     except Exception as e:
-        print('ERROR: ' + str(e), file=sys.stderr)
-        sys.exit(1)
+        err('cannot parse ' + yaml_file + ': ' + str(e))
+
+    # Sanity: require top-level fields to still exist after the roundtrip,
+    # otherwise the offline YAML would be broken in Lutris.
+    missing = [f for f in ('name', 'game_slug', 'slug', 'runner')
+               if not data.get(f)]
+    if missing:
+        err(yaml_file + ' missing required top-level fields: '
+            + ', '.join(missing))
 
     files = data.get('script', {}).get('files', [])
     patched = 0
@@ -374,8 +528,12 @@ def cmd_localize_yaml():
                 value['url'] = file_uri
             patched += 1
 
-    with open(offline_yaml, 'w') as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    try:
+        with open(offline_yaml, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False,
+                      allow_unicode=True, sort_keys=False)
+    except Exception as e:
+        err('cannot write ' + offline_yaml + ': ' + str(e))
 
     print(patched)
 
@@ -387,6 +545,7 @@ COMMANDS = {
     'search_names':          cmd_search_names,
     'has_game_id':           cmd_has_game_id,
     'url_encode':            cmd_url_encode,
+    'extract_gog_id':        cmd_extract_gog_id,
     'find_slug_in_results':  cmd_find_slug_in_results,
     'parse_installers':      cmd_parse_installers,
     'extract_urls':          cmd_extract_urls,
@@ -409,7 +568,23 @@ COMMANDS[sys.argv[1]]()
 PYEOF
 }
 
-py() { python3 "$HELPER_PY" "$@"; }
+# Wrapper around the Python helper.
+# Stderr is redirected to a per-run log so that command substitutions
+# don't pollute returned values, while errors remain visible after the run.
+py() {
+    python3 "$HELPER_PY" "$@" 2>>"$PY_ERROR_LOG"
+}
+
+# Same as py(), but counts non-zero exits in HELPER_ERROR_COUNT.
+# Use this for calls where stderr loss in $() is acceptable but exit-code
+# handling matters.
+py_tracked() {
+    if py "$@"; then
+        return 0
+    fi
+    HELPER_ERROR_COUNT=$((HELPER_ERROR_COUNT + 1))
+    return 1
+}
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
 print_usage() {
@@ -430,8 +605,13 @@ ${BOLD}OPTIONS:${NC}
   -q, --quiet                Less output (errors & summary only)
       --no-resources         Fetch scripts only, skip deeplink downloads
       --prune-old            Remove outdated installer versions after fetching
+      --prune-anyway         Force pruning even if errors occurred
       --api-delay  <sec>     Pause between API requests (default: 1)
   -h, --help                 Show this help
+
+${BOLD}NOTES:${NC}
+  Concurrent runs against the same --output-dir fail fast (flock).
+  PyYAML is required (sudo apt install python3-yaml).
 
 EOF
 }
@@ -442,15 +622,16 @@ parse_args() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -g|--gog-dir)     GOG_DIR="$2";      shift 2 ;;
-            -o|--output-dir)  OUTPUT_DIR="$2";   shift 2 ;;
-            -d|--dry-run)     DRY_RUN=true;      shift   ;;
-            -f|--force)       FORCE=true;        shift   ;;
-            -q|--quiet)       QUIET=true;        shift   ;;
-            --no-resources)   NO_RESOURCES=true; shift   ;;
-            --prune-old)      PRUNE_OLD=true;    shift   ;;
-            --api-delay)      API_DELAY="$2";    shift 2 ;;
-            -h|--help)        print_usage; exit 0        ;;
+            -g|--gog-dir)     GOG_DIR="$2";       shift 2 ;;
+            -o|--output-dir)  OUTPUT_DIR="$2";    shift 2 ;;
+            -d|--dry-run)     DRY_RUN=true;       shift   ;;
+            -f|--force)       FORCE=true;         shift   ;;
+            -q|--quiet)       QUIET=true;         shift   ;;
+            --no-resources)   NO_RESOURCES=true;  shift   ;;
+            --prune-old)      PRUNE_OLD=true;     shift   ;;
+            --prune-anyway)   PRUNE_ANYWAY=true;  shift   ;;
+            --api-delay)      API_DELAY="$2";     shift 2 ;;
+            -h|--help)        print_usage; exit 0         ;;
             *) log_error "Unknown argument: $1"; print_usage; exit 1 ;;
         esac
     done
@@ -458,6 +639,10 @@ parse_args() {
     [[ -z "$GOG_DIR" ]]    && { log_error "--gog-dir is required";    print_usage; exit 1; }
     [[ -z "$OUTPUT_DIR" ]] && { log_error "--output-dir is required"; print_usage; exit 1; }
     [[ ! -d "$GOG_DIR" ]]  && { log_error "GOG directory not found: $GOG_DIR"; exit 1; }
+
+    if $PRUNE_ANYWAY && ! $PRUNE_OLD; then
+        log_warn "--prune-anyway has no effect without --prune-old"
+    fi
 }
 
 suppress_info_in_quiet_mode() {
@@ -472,10 +657,46 @@ setup_output_dirs() {
     TIMESTAMP=$(date +"%Y-%m-%d_%H-%M")
     DIR_REPORTS="$OUTPUT_DIR/reports"
     DIR_RUN="$DIR_REPORTS/runs/$TIMESTAMP"
+    LOCK_FILE="$DIR_REPORTS/.ottercache.lock"
+    PY_ERROR_LOG="$DIR_RUN/py_errors.log"
     if ! $DRY_RUN; then
         mkdir -p "$DIR_REPORTS"
         mkdir -p "$DIR_RUN"
+        : > "$PY_ERROR_LOG"
+    else
+        # Dry-run still needs a writable location for stderr capture.
+        PY_ERROR_LOG=$(mktemp /tmp/ottercache_pyerr_XXXXXX.log)
     fi
+}
+
+acquire_lock() {
+    # Dry-run runs read-only against output_dir → no locking needed.
+    $DRY_RUN && return 0
+
+    if ! command -v flock &>/dev/null; then
+        log_warn "flock not found – concurrent runs are not protected"
+        return 0
+    fi
+
+    # Open lock file on a Bash-assigned FD and try non-blocking exclusive lock.
+    # The {LOCK_FD}>file syntax (bash >= 4.1) lets us avoid eval and the
+    # double-expansion vulnerability that comes with it.
+    if ! exec {LOCK_FD}>"$LOCK_FILE"; then
+        log_error "Cannot open lock file: $LOCK_FILE"
+        exit 1
+    fi
+    if ! flock -n "$LOCK_FD"; then
+        log_error "Another ottercache instance holds the lock on:"
+        log_error "  $LOCK_FILE"
+        log_error "Wait for it to finish, or use a different --output-dir."
+        exit 1
+    fi
+}
+
+release_lock() {
+    [[ -n "${LOCK_FD:-}" ]] || return 0
+    exec {LOCK_FD}>&- 2>/dev/null || true
+    LOCK_FD=""
 }
 
 start_logging() {
@@ -490,8 +711,10 @@ setup_helper_python() {
     $DRY_RUN || [[ -f "$SLUG_CACHE_FILE" ]] || echo '{}' > "$SLUG_CACHE_FILE"
 }
 
-cleanup_helper() {
+cleanup() {
     [[ -n "$HELPER_PY" && -f "$HELPER_PY" ]] && rm -f "$HELPER_PY"
+    $DRY_RUN && [[ -n "$PY_ERROR_LOG" && -f "$PY_ERROR_LOG" ]] && rm -f "$PY_ERROR_LOG"
+    release_lock
 }
 
 check_dependencies() {
@@ -505,9 +728,21 @@ check_dependencies() {
             missing=$((missing + 1))
         fi
     done
-    python3 -c "import yaml" 2>/dev/null \
-        && log_ok "python3-yaml available" \
-        || log_warn "python3-yaml not found – offline localization disabled"
+
+    if python3 -c "import yaml" 2>/dev/null; then
+        log_ok "python3-yaml available"
+    else
+        log_error "python3-yaml not found → sudo apt install python3-yaml"
+        log_error "(required for installer YAML generation per Lutris spec)"
+        missing=$((missing + 1))
+    fi
+
+    if command -v flock &>/dev/null; then
+        log_ok "flock available"
+    else
+        log_warn "flock not found – concurrent runs are not protected"
+    fi
+
     [[ "$missing" -gt 0 ]] && { log_error "Missing required dependencies"; exit 1; }
 }
 
@@ -549,7 +784,7 @@ is_http_success() {
 
 # ── Game detection ────────────────────────────────────────────────────────────
 extract_gog_id_from_filename() {
-    echo "$1" | grep -oP '[[(]?\K\d{9,10}(?=[)]]|[._\- ]|$)' | head -1 || true
+    py extract_gog_id "$1"
 }
 
 extract_game_name_from_filename() {
@@ -575,7 +810,10 @@ scan_product_json_files() {
     log_info "Scanning product_*.json metadata in: $GOG_DIR"
     while IFS= read -r json_file; do
         local title
-        title=$(py product_title "$json_file" 2>/dev/null || true)
+        title=$(py product_title "$json_file") || {
+            log_warn "Skipped product file (helper error): $json_file"
+            continue
+        }
         [[ -n "$title" ]] && register_game "$title"
     done < <(find "$GOG_DIR" -maxdepth 2 -name "product_*.json" 2>/dev/null)
     log_info "product_*.json: ${#GAMES[@]} games found"
@@ -631,14 +869,14 @@ try_direct_slug() {
     local code
     code=$(http_get "${LUTRIS_API}/games/${candidate_slug}/installers?format=json" "$tmp_file")
     [[ "$code" != "200" ]] && return 1
-    py has_game_id "$tmp_file" 2>/dev/null
+    py has_game_id "$tmp_file"
 }
 
 resolve_slug_by_name() {
     local search_name="$1" tmp_file="$2"
     log_info "Searching by name: $search_name"
     local encoded
-    encoded=$(py url_encode "$search_name" 2>/dev/null || echo "$search_name")
+    encoded=$(py url_encode "$search_name") || encoded="$search_name"
 
     local code
     code=$(http_get "${LUTRIS_API}/games?search=${encoded}&format=json" "$tmp_file")
@@ -647,7 +885,7 @@ resolve_slug_by_name() {
         return 2
     fi
 
-    py find_slug_in_results "$search_name" "$tmp_file" 2>/dev/null || true
+    py find_slug_in_results "$search_name" "$tmp_file" || true
 }
 
 resolve_game_slug() {
@@ -663,7 +901,7 @@ resolve_game_slug() {
             break
         fi
         sleep 0.3
-    done < <(py slug_candidates "$game_name" 2>/dev/null)
+    done < <(py slug_candidates "$game_name")
 
     if [[ -z "$slug" ]]; then
         while IFS= read -r search_name; do
@@ -677,7 +915,7 @@ resolve_game_slug() {
                 slug="$result"; break
             fi
             sleep 0.3
-        done < <(py search_names "$game_name" 2>/dev/null)
+        done < <(py search_names "$game_name")
     fi
 
     rm -f "$tmp"
@@ -797,13 +1035,26 @@ process_installer_dry_run() {
 
 process_installer_real() {
     local data_file="$1" installer_slug="$2" inst_dir="$3" dir_name="$4"
-    local safe_slug
+    local safe_slug yaml_file
     safe_slug=$(to_safe_name "$installer_slug")
+    yaml_file="$inst_dir/${safe_slug}.yaml"
 
     mkdir -p "$inst_dir"
-    py save_installer_json "$data_file" "$installer_slug" "$inst_dir" 2>/dev/null
-    py save_installer_yaml "$data_file" "$installer_slug" "$inst_dir/${safe_slug}.yaml" 2>/dev/null
-    [[ -f "$inst_dir/${safe_slug}.yaml" ]] && log_ok "YAML saved: ${safe_slug}.yaml"
+
+    if ! py save_installer_json "$data_file" "$installer_slug" "$inst_dir"; then
+        log_error "Failed to save installer JSON: $installer_slug"
+        RESOURCE_ERRORS+=("$dir_name  |  JSON_GENERATION_FAILED  |  $installer_slug")
+    fi
+
+    if py save_installer_yaml "$data_file" "$installer_slug" "$yaml_file"; then
+        log_ok "YAML saved: ${safe_slug}.yaml"
+    else
+        log_error "Failed to generate installer YAML: $installer_slug"
+        log_error "  → see $PY_ERROR_LOG for the underlying Python error"
+        YAML_GENERATION_FAILURES+=("$installer_slug  →  $dir_name")
+        # Without a valid YAML, downloading resources is wasted I/O.
+        return 1
+    fi
 
     $NO_RESOURCES || download_resources "$data_file" "$installer_slug" "$inst_dir" "$dir_name"
 }
@@ -832,7 +1083,7 @@ process_installer() {
     if $DRY_RUN; then
         process_installer_dry_run "$data_file" "$installer_slug" "$dir_name"
     else
-        process_installer_real "$data_file" "$installer_slug" "$inst_dir" "$dir_name"
+        process_installer_real "$data_file" "$installer_slug" "$inst_dir" "$dir_name" || return
     fi
 
     SUCCESS_INSTALLERS+=("$game_name  →  $dir_name$(${DRY_RUN} && echo '  [DRY-RUN]')")
@@ -846,9 +1097,9 @@ process_game() {
 
     if ! $FORCE && ! $DRY_RUN; then
         local cached_slug
-        cached_slug=$(py cache_get "$SLUG_CACHE_FILE" "$game_key" 2>/dev/null || true)
+        cached_slug=$(py cache_get "$SLUG_CACHE_FILE" "$game_key")
         if [[ -n "$cached_slug" ]] \
-           && py cache_check "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR" 2>/dev/null; then
+           && py cache_check "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR"; then
             log_info "All installers cached → skipping API calls"
             SKIPPED_GAMES+=("$game_name  [fully cached, use --force to refresh]")
             return
@@ -860,6 +1111,7 @@ process_game() {
 
     if [[ "$game_slug" == "API_ERROR" ]]; then
         SKIPPED_GAMES+=("$game_name  [API unreachable]")
+        API_ERROR_COUNT=$((API_ERROR_COUNT + 1))
         return
     fi
     if [[ -z "$game_slug" ]]; then
@@ -885,6 +1137,7 @@ process_game() {
     if [[ "$http_code" != "200" ]]; then
         log_warn "Game detail API unreachable (HTTP $http_code) → skipped"
         SKIPPED_GAMES+=("$game_name  [game detail HTTP $http_code]")
+        API_ERROR_COUNT=$((API_ERROR_COUNT + 1))
         rm -f "$tmp_game"; return
     fi
 
@@ -908,31 +1161,65 @@ process_game() {
         process_installer "$tmp_game" "$entry" "$game_name"
     done
 
-    $DRY_RUN || py cache_update "$SLUG_CACHE_FILE" "$game_key" "$game_slug" "${installer_dirs[@]}" 2>/dev/null
+    if ! $DRY_RUN; then
+        py cache_update "$SLUG_CACHE_FILE" "$game_key" "$game_slug" "${installer_dirs[@]}" \
+            || log_warn "Failed to update slug cache for $game_name"
+    fi
 
     rm -f "$tmp_game"
 }
 
 # ── Prune old installer versions ──────────────────────────────────────────────
+should_prune() {
+    if ! $PRUNE_OLD; then
+        return 1
+    fi
+    if $PRUNE_ANYWAY; then
+        return 0
+    fi
+    if [[ "${#RESOURCE_ERRORS[@]}" -gt 0 ]] \
+       || [[ "${#BROKEN_LINKS[@]}" -gt 0 ]] \
+       || [[ "${#YAML_GENERATION_FAILURES[@]}" -gt 0 ]] \
+       || [[ "$API_ERROR_COUNT" -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
 prune_old_installer_dirs() {
-    $PRUNE_OLD || return
+    if ! $PRUNE_OLD; then
+        return
+    fi
+
+    if ! should_prune; then
+        print_header "… Pruning skipped (errors detected)"
+        log_warn "Errors detected during run; skipping prune to avoid losing"
+        log_warn "the only working version of an installer."
+        log_warn "Counts: api=$API_ERROR_COUNT, broken_links=${#BROKEN_LINKS[@]}, "
+        log_warn "        download_errors=${#RESOURCE_ERRORS[@]}, yaml_fails=${#YAML_GENERATION_FAILURES[@]}"
+        log_warn "Use --prune-anyway to override after reviewing the report."
+        return
+    fi
 
     print_header "… Pruning old installer versions"
 
     local outdated_json
-    outdated_json=$(py find_outdated "$OUTPUT_DIR")
+    outdated_json=$(py find_outdated "$OUTPUT_DIR") || {
+        log_error "Failed to scan output dir for outdated versions"
+        return
+    }
 
     if $DRY_RUN; then
         local count=0
         while IFS= read -r line; do
             log_dryrun "$line"
             count=$((count + 1))
-        done < <(py prune_preview "$outdated_json" 2>/dev/null || true)
+        done < <(py prune_preview "$outdated_json" || true)
         [[ "$count" -eq 0 ]] && log_ok "No outdated versions found"
         return
     fi
 
-    mapfile -t PRUNED_DIRS < <(py prune_apply "$outdated_json" "$OUTPUT_DIR" 2>/dev/null || true)
+    mapfile -t PRUNED_DIRS < <(py prune_apply "$outdated_json" "$OUTPUT_DIR" || true)
 
     if [[ "${#PRUNED_DIRS[@]}" -eq 0 ]]; then
         log_ok "No outdated versions found"
@@ -951,13 +1238,12 @@ localize_installer_yaml() {
     local offline_yaml="${yaml_file%.yaml}_offline.yaml"
 
     local patched
-    patched=$(py localize_yaml "$yaml_file" "$resource_dir" "$offline_yaml" 2>/dev/null || true)
-
-    if [[ -f "$offline_yaml" ]]; then
+    if patched=$(py localize_yaml "$yaml_file" "$resource_dir" "$offline_yaml"); then
         log_ok "Offline YAML saved: $(basename "$offline_yaml")  (${patched:-0} URLs localized)"
         LOCALIZED_YAMLS+=("$offline_yaml")
     else
-        log_warn "Offline YAML generation failed: $(basename "$yaml_file")"
+        log_error "Offline YAML generation failed: $(basename "$yaml_file")"
+        log_error "  → see $PY_ERROR_LOG"
     fi
 }
 
@@ -1004,6 +1290,9 @@ ${separator}
   Old versions pruned  : ${#PRUNED_DIRS[@]}
   Broken links         : ${#BROKEN_LINKS[@]}
   Download errors      : ${#RESOURCE_ERRORS[@]}
+  YAML generation fails: ${#YAML_GENERATION_FAILURES[@]}
+  API errors           : $API_ERROR_COUNT
+  Helper errors        : $HELPER_ERROR_COUNT
 
 REPORT
 
@@ -1027,6 +1316,14 @@ REPORT
         printf '  ✂  %s\n' "${PRUNED_DIRS[@]}"
         echo ""
     }
+    [[ "${#YAML_GENERATION_FAILURES[@]}" -gt 0 ]] && {
+        echo "── YAML GENERATION FAILURES ────────────────────────────────────"
+        echo "  These installers were skipped because the YAML could not be"
+        echo "  generated. Inspect $PY_ERROR_LOG for details."
+        echo ""
+        printf '  ✗  %s\n' "${YAML_GENERATION_FAILURES[@]}"
+        echo ""
+    }
     [[ "${#BROKEN_LINKS[@]}" -gt 0 ]] && {
         echo "── BROKEN LINKS ────────────────────────────────────────────────"
         echo "  Format: installer folder  |  HTTP code  |  URL"
@@ -1039,6 +1336,12 @@ REPORT
         printf '  !  %s\n' "${RESOURCE_ERRORS[@]}"
         echo ""
     }
+    if [[ -s "$PY_ERROR_LOG" ]]; then
+        echo "── PYTHON HELPER ERRORS (first 30 lines) ───────────────────────"
+        head -30 "$PY_ERROR_LOG"
+        echo "  (full log: $PY_ERROR_LOG)"
+        echo ""
+    fi
     echo "${separator}"
 }
 
@@ -1054,6 +1357,8 @@ print_summary() {
 
     echo ""
     [[ "${#BROKEN_LINKS[@]}" -gt 0 ]] && log_warn "${#BROKEN_LINKS[@]} broken link(s) – see report for details"
+    [[ "${#YAML_GENERATION_FAILURES[@]}" -gt 0 ]] && log_warn "${#YAML_GENERATION_FAILURES[@]} YAML generation failure(s) – Lutris will not be able to install these"
+    [[ "$HELPER_ERROR_COUNT" -gt 0 ]] && log_warn "$HELPER_ERROR_COUNT Python helper error(s) – see $PY_ERROR_LOG"
     log_ok "Done  |  Total size: $(du -sh "$OUTPUT_DIR" 2>/dev/null | cut -f1 || echo '?')"
     $DRY_RUN && log_warn "DRY-RUN: no files were written"
 }
@@ -1063,17 +1368,19 @@ main() {
     parse_args "$@"
     suppress_info_in_quiet_mode
     setup_output_dirs
+    acquire_lock
     start_logging
     setup_helper_python
-    trap cleanup_helper EXIT
+    trap cleanup EXIT
 
     print_header "ottercache"
     log_info "GOG directory : $GOG_DIR"
     log_info "Output target : $OUTPUT_DIR"
-    $DRY_RUN      && log_warn "DRY-RUN active – no files will be written"
-    $FORCE        && log_warn "FORCE active – existing files will be overwritten"
-    $NO_RESOURCES && log_info "Scripts only – deeplink downloads skipped"
-    $PRUNE_OLD    && log_info "Outdated installer versions will be pruned"
+    $DRY_RUN       && log_warn "DRY-RUN active – no files will be written"
+    $FORCE         && log_warn "FORCE active – existing files will be overwritten"
+    $NO_RESOURCES  && log_info "Scripts only – deeplink downloads skipped"
+    $PRUNE_OLD     && log_info "Outdated installer versions will be pruned"
+    $PRUNE_ANYWAY  && log_warn "PRUNE-ANYWAY active – pruning ignores run errors"
 
     check_dependencies
     detect_games
