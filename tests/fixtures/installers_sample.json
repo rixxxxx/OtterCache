@@ -1,0 +1,36 @@
+{
+    "id": 42,
+    "name": "Sample Game",
+    "slug": "sample-game",
+    "installers": [
+        {
+            "slug": "sample-game-wine",
+            "name": "Sample Game (Wine)",
+            "game_slug": "sample-game",
+            "runner": "wine",
+            "version": "1.0",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "published": true,
+            "script": {
+                "files": [
+                    {"patch": "https://example.com/patch.zip"},
+                    {"tool": "https://example.com/tool.7z"}
+                ]
+            },
+            "content": "game:\n  exe: setup.exe\n"
+        },
+        {
+            "slug": "sample-game-dosbox",
+            "name": "Sample Game (DOSBox)",
+            "game_slug": "sample-game",
+            "runner": "dosbox",
+            "version": "1.0",
+            "updated_at": "2024-02-01T00:00:00Z",
+            "published": false,
+            "script": {
+                "files": []
+            },
+            "content": "game:\n  main_file: game.exe\n"
+        }
+    ]
+}

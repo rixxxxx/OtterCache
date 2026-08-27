@@ -1,0 +1,10 @@
+name: Sample Game (Wine)
+game_slug: sample-game
+slug: sample-game-wine
+runner: wine
+script:
+  game:
+    exe: setup.exe
+  files:
+    - patch: https://example.com/patch.zip
+    - tool: https://example.com/tool.7z

@@ -1,0 +1,6 @@
+{
+    "results": [
+        {"id": 1, "name": "Sample Game", "slug": "sample-game"},
+        {"id": 2, "name": "Sample Game 2", "slug": "sample-game-2"}
+    ]
+}
