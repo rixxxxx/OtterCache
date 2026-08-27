@@ -5,7 +5,9 @@
       "Bash(rtk git *)",
       "Bash(rtk file *)",
       "Bash(rtk wc *)",
-      "Bash(rtk read *)"
+      "Bash(rtk read *)",
+      "Bash(bash -n ottercache)",
+      "Bash(rtk grep *)"
     ]
   }
 }
