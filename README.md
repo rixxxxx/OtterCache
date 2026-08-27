@@ -92,7 +92,7 @@ lgogdownloader \
 |---|---|
 | `curl` | `sudo apt install curl` |
 | `python3` | `sudo apt install python3` |
-| `python3-yaml` | `sudo apt install python3-yaml` (optional, fallback active) |
+| `python3-yaml` | `sudo apt install python3-yaml` (required — YAML generation follows the Lutris spec; `check_dependencies()` refuses to start without it) |
 
 ## Installation
 
@@ -215,6 +215,22 @@ Every run produces a summary in `<output-dir>/reports/` containing:
 - Skipped games (not found on `lutris.net` or no installer available)
 - Broken links (404, timeout, etc.) with full URLs
 - Download errors
+
+## Testing
+
+`ottercache` ships a small, framework-free test suite under `tests/` that
+checks the behavior documented in this README (CLI flags, dry-run never
+writing files, game-detection priority/dedup rules, etc.) plus the embedded
+Python helper's individual commands, using local fixtures — no network
+access or `lutris.net` account required.
+
+```bash
+./tests/run_tests.sh
+```
+
+Everything runs against `curl`-free fixtures except two YAML-related checks,
+which are skipped automatically (not failed) if `python3-yaml` isn't
+installed on the host.
 
 ## Known limitations
 
