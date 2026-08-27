@@ -200,8 +200,22 @@ def cmd_slug_candidates():
         return re.sub(r'[^a-z0-9]+', '-', s).strip('-')
 
     variants = [
-        title,                                                                                                # full
-        re.sub(r'\s*\(\d{4}\)\s*
+        title,                                                                       # full
+        re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip(),                              # drop (YYYY)
+        re.sub(r'\s*\([^)]*\)\s*$', '', title).strip(),                              # drop (...)
+        re.sub(r'\s*:\s*.*$', '', re.sub(r'[™®†‡]', '', title)).strip(),  # drop subtitle
+        re.sub(r'\s+\d+\b', '', title).strip(),                                      # drop trailing digits
+        re.sub(r'\s*:\s*.*$', '', re.sub(r'\s+\d+\b', '', title)).strip(),           # drop subtitle + digits
+    ]
+
+    seen = set()
+    for variant in variants:
+        if not variant:
+            continue
+        for slug in (to_slug_strip(variant), to_slug_keep_tm(variant)):
+            if slug and slug not in seen:
+                seen.add(slug)
+                print(slug)
 
 
 def cmd_search_names():
@@ -1510,4 +1524,6 @@ main() {
     print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
