@@ -7,7 +7,9 @@
       "Bash(rtk wc *)",
       "Bash(rtk read *)",
       "Bash(bash -n ottercache)",
-      "Bash(rtk grep *)"
+      "Bash(rtk grep *)",
+      "WebFetch(domain:lutris.net)",
+      "WebFetch(domain:gog.com)"
     ]
   }
 }
