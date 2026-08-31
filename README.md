@@ -258,6 +258,7 @@ installed on the host.
 - **Broken deeplinks:** Some installer scripts reference files that have since moved or been deleted. These are flagged in the report.
 - **Rate limiting:** `lutris.net` may throttle requests. Increase `--api-delay` if you see frequent API errors.
 - **Online required for fetching:** `ottercache` itself requires internet access to query `lutris.net`. The resulting scripts and resources work fully offline.
+- **Transient errors are retried automatically:** HTTP timeouts, 429s and 5xx responses (API calls and resource downloads alike) are retried with backoff before being reported as broken. Large deeplink resources (multi-GB installers) are downloaded with a stall-based timeout rather than a fixed one, so a slow-but-steady transfer isn't aborted early — only a connection that actually goes idle is. Re-running without `--force` backfills only the resources that are still missing from an already-processed installer, instead of skipping the whole game or re-downloading everything.
 
 ## License
 

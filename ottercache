@@ -49,7 +49,18 @@ set -uo pipefail
 readonly LUTRIS_API="https://lutris.net/api"
 readonly USER_AGENT="Mozilla/5.0 (X11; Linux x86_64)"
 readonly CURL_TIMEOUT=15
-readonly DOWNLOAD_TIMEOUT=300
+# DOWNLOAD_TIMEOUT is now just an outer safety net against pathological
+# hangs (e.g. a connection that limps along at 1 byte every 59s forever) --
+# the real stall detection is DOWNLOAD_MIN_SPEED/DOWNLOAD_STALL_TIME below.
+# It used to be a hard 300s wall-clock cap on the *entire* transfer, which
+# aborted large-but-healthy deeplink resources (multi-GB installers) well
+# before they could finish, even though the same URL downloaded fine
+# manually in a browser (no such cap there).
+readonly DOWNLOAD_TIMEOUT=21600
+readonly DOWNLOAD_MIN_SPEED=1024
+readonly DOWNLOAD_STALL_TIME=60
+readonly MAX_ATTEMPTS=3
+readonly RETRY_BACKOFF_BASE=2
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 readonly RED=$'\033[0;31m'   GREEN=$'\033[0;32m'  YELLOW=$'\033[1;33m'
@@ -176,11 +187,30 @@ def _match_score(input_title, candidate_name):
     return len(overlap) / len(input_tokens)
 
 
-def cmd_url_to_filename():
-    url = sys.argv[2]
+def _url_to_filename(url):
     p = urllib.parse.urlparse(url)
     name = os.path.basename(urllib.parse.unquote(p.path))
-    print(name if name and '.' in name else 'resource_unknown')
+    return name if name and '.' in name else 'resource_unknown'
+
+
+def _resource_urls(installer):
+    """Yield deeplink resource URLs referenced by one installer entry's
+    script.files. Shared by cmd_extract_urls (network path, given a freshly
+    fetched API response) and cmd_cache_check (local path, given a
+    previously saved <slug>.json) so both agree on what a game's resource
+    set is."""
+    for f in installer.get('script', {}).get('files', []):
+        if not isinstance(f, dict):
+            continue
+        for k, v in f.items():
+            if isinstance(v, str) and v.startswith('http'):
+                yield v
+            elif isinstance(v, dict) and 'url' in v:
+                yield v['url']
+
+
+def cmd_url_to_filename():
+    print(_url_to_filename(sys.argv[2]))
 
 
 def cmd_product_title():
@@ -404,14 +434,8 @@ def cmd_extract_urls():
     for inst in data.get('installers', []):
         if inst.get('slug') != target_slug:
             continue
-        for f in inst.get('script', {}).get('files', []):
-            if not isinstance(f, dict):
-                continue
-            for k, v in f.items():
-                if isinstance(v, str) and v.startswith('http'):
-                    print(v)
-                elif isinstance(v, dict) and 'url' in v:
-                    print(v['url'])
+        for url in _resource_urls(inst):
+            print(url)
 
 
 def cmd_save_installer_json():
@@ -600,18 +624,47 @@ def cmd_cache_get():
 
 
 def cmd_cache_check():
-    """Boolean check: exit 0 if all cached dirs exist, else exit 1."""
+    """Boolean check: exit 0 if all cached dirs exist and (unless
+    no_resources) every deeplink resource referenced by each dir's own saved
+    <slug>.json is present on disk too.
+
+    Why the resource check matters: previously this only checked directory
+    existence, so a game whose installer folder was created but lost a
+    resource to a transient error (e.g. an HTTP 504 mid-run) looked
+    permanently 'fully cached' -- process_game() would skip it, API calls
+    and all, on every future run, and the only way to fetch the missing
+    file was --force (which redownloads everything, not just what's
+    missing). Reading the resource list from the *locally saved* JSON here
+    (rather than the live API) keeps this check network-free.
+    """
     try:
         with open(sys.argv[2]) as f:
             data = json.load(f)
         dirs = data.get(sys.argv[3], {}).get('dirs', [])
         outdir = sys.argv[4]
+        no_resources = len(sys.argv) > 5 and sys.argv[5] == 'true'
         if not dirs:
             sys.exit(1)
         for d in dirs:
-            if not os.path.isdir(os.path.join(outdir, d)):
+            inst_dir = os.path.join(outdir, d)
+            if not os.path.isdir(inst_dir):
                 sys.exit(1)
+            if no_resources:
+                continue
+            for entry in os.scandir(inst_dir):
+                if not entry.name.endswith('.json'):
+                    continue
+                try:
+                    with open(entry.path) as jf:
+                        inst = json.load(jf)
+                except Exception:
+                    continue
+                for url in _resource_urls(inst):
+                    if not os.path.exists(os.path.join(inst_dir, _url_to_filename(url))):
+                        sys.exit(1)
         sys.exit(0)
+    except SystemExit:
+        raise
     except Exception as e:
         print('PY_WARN cache_check: ' + str(e), file=sys.stderr)
         sys.exit(1)
@@ -982,25 +1035,46 @@ to_safe_name() {
 }
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
+# Transient codes worth retrying: 000 (curl-level timeout/unreachable), 429
+# (rate limited — no Retry-After parsing, just backoff) and any 5xx (server
+# error / gateway timeout, e.g. a GitHub release asset momentarily 504ing).
+# 4xx other than 429 (404, 403, 401, 410, ...) are permanent — retrying them
+# just wastes MAX_ATTEMPTS worth of timeouts.
+is_retryable_http_code() {
+    case "$1" in 000|429|5??) return 0 ;; *) return 1 ;; esac
+}
+
+# Runs a curl invocation (args passed through verbatim, expected to include
+# -w "%{http_code}") up to MAX_ATTEMPTS times with exponential backoff while
+# the resulting HTTP code is retryable. Prints the final code to stdout.
+curl_with_retry() {
+    local code attempt
+    for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+        code=$(curl "$@" 2>/dev/null | grep -oE '^[0-9]{3}' || true)
+        code="${code:-000}"
+        is_retryable_http_code "$code" || break
+        [[ "$attempt" -eq "$MAX_ATTEMPTS" ]] && break
+        log_warn "  Transient HTTP $code — retry $attempt/$((MAX_ATTEMPTS - 1)) in $((RETRY_BACKOFF_BASE ** attempt))s"
+        sleep "$((RETRY_BACKOFF_BASE ** attempt))"
+    done
+    echo "$code"
+}
+
 http_get() {
     local url="$1" out_file="$2"
-    local code
-    code=$(curl -s -o "$out_file" -w "%{http_code}" \
+    curl_with_retry -s -o "$out_file" -w "%{http_code}" \
         --max-time "$CURL_TIMEOUT" \
         --header "Accept: application/json" \
         --user-agent "$USER_AGENT" \
-        "$url" 2>/dev/null | grep -oE '^[0-9]{3}' || true)
-    echo "${code:-000}"
+        "$url"
 }
 
 check_url_status() {
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" \
+    curl_with_retry -s -o /dev/null -w "%{http_code}" \
         --max-time "$CURL_TIMEOUT" \
         --location --max-redirs 5 \
         --user-agent "$USER_AGENT" \
-        "$1" 2>/dev/null | grep -oE '^[0-9]{3}' || true)
-    echo "${code:-000}"
+        "$1"
 }
 
 is_http_success() {
@@ -1220,6 +1294,49 @@ check_resources_dry_run() {
     done
 }
 
+# Downloads url to out_file, retrying with backoff on curl-level failure
+# (network hiccups, gateway timeouts mid-transfer) up to MAX_ATTEMPTS times.
+# --speed-limit/--speed-time abort only on a genuine stall (throughput below
+# DOWNLOAD_MIN_SPEED for DOWNLOAD_STALL_TIME seconds straight), not on
+# elapsed time — a slow-but-steady multi-GB transfer is left alone.
+download_with_retry() {
+    local url="$1" out_file="$2" attempt
+    for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+        curl -s -L \
+            --max-time "$DOWNLOAD_TIMEOUT" \
+            --speed-limit "$DOWNLOAD_MIN_SPEED" \
+            --speed-time "$DOWNLOAD_STALL_TIME" \
+            --user-agent "$USER_AGENT" \
+            --output "$out_file" \
+            "$url" 2>/dev/null && return 0
+        [[ "$attempt" -eq "$MAX_ATTEMPTS" ]] && return 1
+        log_warn "  Download attempt $attempt failed — retry in $((RETRY_BACKOFF_BASE ** attempt))s: $(basename "$out_file")"
+        sleep "$((RETRY_BACKOFF_BASE ** attempt))"
+    done
+    return 1
+}
+
+# Best-effort Content-Length probe via a single HEAD request (not retried —
+# purely advisory, used to show the expected size up front and to verify
+# completeness afterward). Prints nothing (not an error) if the host
+# rejects HEAD, omits Content-Length, or the request fails for any reason;
+# callers must treat an empty result as "size unknown" and skip accordingly.
+probe_content_length() {
+    local size
+    size=$(curl -s -o /dev/null -L --max-redirs 5 --head \
+        --max-time "$CURL_TIMEOUT" \
+        --user-agent "$USER_AGENT" \
+        -w "%{content_length}" \
+        "$1" 2>/dev/null)
+    [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]] && echo "$size"
+}
+
+# Human-readable byte count (e.g. "8.9G"), falling back to a raw byte count
+# if numfmt isn't available for some reason (it's a GNU coreutils staple).
+human_size() {
+    numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 bytes"
+}
+
 download_resource() {
     local url="$1" out_file="$2" dir_name="$3"
     local fname http_code
@@ -1236,11 +1353,21 @@ download_resource() {
 
     is_http_success "$http_code" || return
 
-    if curl -s -L \
-        --max-time "$DOWNLOAD_TIMEOUT" \
-        --user-agent "$USER_AGENT" \
-        --output "$out_file" \
-        "$url" 2>/dev/null; then
+    local expected_size
+    expected_size=$(probe_content_length "$url")
+    [[ -n "$expected_size" ]] && log_info "  Expected size: $(human_size "$expected_size")"
+
+    if download_with_retry "$url" "$out_file"; then
+        if [[ -n "$expected_size" ]]; then
+            local actual_size
+            actual_size=$(stat -c%s "$out_file" 2>/dev/null || echo 0)
+            if [[ "$actual_size" -ne "$expected_size" ]]; then
+                log_warn "Size mismatch for $fname: expected $(human_size "$expected_size"), got $(human_size "$actual_size") — treating as failed"
+                RESOURCE_ERRORS+=("$dir_name  |  SIZE_MISMATCH  |  $url")
+                rm -f "$out_file"
+                return
+            fi
+        fi
         local size
         size=$(du -sh "$out_file" 2>/dev/null | cut -f1)
         log_ok "Saved: $fname ($size)"
@@ -1303,6 +1430,22 @@ process_installer_real() {
     $NO_RESOURCES || download_resources "$data_file" "$installer_slug" "$inst_dir" "$dir_name"
 }
 
+# True (exit 0) if inst_dir already exists but at least one deeplink
+# resource referenced by installer_slug's API entry is missing on disk —
+# e.g. a previous run's download failed (HTTP error, interrupted transfer).
+# Backed by the freshly fetched data_file, so no extra network round-trip.
+installer_has_missing_resources() {
+    local data_file="$1" installer_slug="$2" inst_dir="$3"
+    $NO_RESOURCES && return 1
+    local url fname
+    while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        fname=$(py url_to_filename "$url")
+        [[ -f "$inst_dir/$fname" ]] || return 0
+    done < <(py extract_urls "$data_file" "$installer_slug")
+    return 1
+}
+
 process_installer() {
     local data_file="$1" entry="$2" game_name="$3"
     local installer_slug runner updated status
@@ -1319,9 +1462,13 @@ process_installer() {
     log_info "Folder    : $dir_name"
 
     if [[ -d "$inst_dir" ]] && ! $FORCE; then
-        log_skip "Already cached – skipping"
-        CACHED_INSTALLERS+=("$game_name  →  $dir_name")
-        return
+        if installer_has_missing_resources "$data_file" "$installer_slug" "$inst_dir"; then
+            log_info "Already cached but missing resource(s) – retrying downloads only"
+        else
+            log_skip "Already cached – skipping"
+            CACHED_INSTALLERS+=("$game_name  →  $dir_name")
+            return
+        fi
     fi
 
     if $DRY_RUN; then
@@ -1343,7 +1490,7 @@ process_game() {
         local cached_slug
         cached_slug=$(py cache_get "$SLUG_CACHE_FILE" "$game_key")
         if [[ -n "$cached_slug" ]] \
-           && py cache_check "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR"; then
+           && py cache_check "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR" "$NO_RESOURCES"; then
             log_info "All installers cached → skipping API calls"
             SKIPPED_GAMES+=("$game_name  [fully cached, use --force to refresh]")
             return

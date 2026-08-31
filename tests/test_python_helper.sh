@@ -135,6 +135,42 @@ assert_eq "" \
     "$(py override_get "$TMP_DIR/does-not-exist.json" "beneath a steel sky")" \
     "override_get returns empty (not an error) when the overrides file doesn't exist yet"
 
+# ── cache_check (resource-completeness) ─────────────────────────────────────
+# Regression coverage for the "504 on one deeplink resource silently marks
+# the whole game as permanently fully-cached" bug: cache_check must now also
+# verify, from each cached dir's own saved <slug>.json, that every
+# referenced resource file actually exists on disk.
+cache_dir="$TMP_DIR/cache_check"
+inst_dir="$cache_dir/outdir/some-installer-dir"
+mkdir -p "$inst_dir"
+cat > "$cache_dir/cache.json" <<'EOF'
+{"my game": {"slug": "my-game", "dirs": ["some-installer-dir"]}}
+EOF
+cat > "$inst_dir/my-game.json" <<'EOF'
+{
+  "slug": "my-game",
+  "script": {
+    "files": [
+      {"patch": "https://example.com/patch.zip"}
+    ]
+  }
+}
+EOF
+
+assert_failure "cache_check fails when a referenced resource file is missing on disk" \
+    py cache_check "$cache_dir/cache.json" "my game" "$cache_dir/outdir" "false"
+
+: > "$inst_dir/patch.zip"
+assert_success "cache_check succeeds once the referenced resource file exists on disk" \
+    py cache_check "$cache_dir/cache.json" "my game" "$cache_dir/outdir" "false"
+
+rm -f "$inst_dir/patch.zip"
+assert_success "cache_check ignores missing resources when no_resources is true" \
+    py cache_check "$cache_dir/cache.json" "my game" "$cache_dir/outdir" "true"
+
+assert_failure "cache_check fails when the cached dir itself doesn't exist" \
+    py cache_check "$cache_dir/cache.json" "my game" "$cache_dir/nonexistent-outdir" "false"
+
 # ── parse_installers ─────────────────────────────────────────────────────────
 installers_out=$(py parse_installers "$FIXTURES/installers_sample.json")
 assert_contains "$installers_out" \
