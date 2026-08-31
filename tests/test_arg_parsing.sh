@@ -52,6 +52,19 @@ run --gog-dir "$TMP_DIR/does-not-exist" --output-dir "$TMP_DIR/out"
 assert_eq "1" "$RUN_EXIT" "nonexistent --gog-dir exits 1"
 assert_contains "$RUN_STDERR" "GOG directory not found" "nonexistent --gog-dir reports the correct error"
 
+# ── --slug-overrides must exist if given ────────────────────────────────────
+run --gog-dir "$TMP_DIR" --output-dir "$TMP_DIR/out" \
+    --slug-overrides "$TMP_DIR/does-not-exist.json"
+assert_eq "1" "$RUN_EXIT" "nonexistent --slug-overrides file exits 1"
+assert_contains "$RUN_STDERR" "Slug overrides file not found" \
+    "nonexistent --slug-overrides file reports the correct error"
+
+echo '{}' > "$TMP_DIR/overrides.json"
+run --gog-dir "$TMP_DIR" --output-dir "$TMP_DIR/out4" \
+    --slug-overrides "$TMP_DIR/overrides.json" --dry-run
+assert_not_contains "$RUN_STDERR" "Slug overrides file not found" \
+    "existing --slug-overrides file passes validation (parse_args accepts it)"
+
 # ── unknown flag ──────────────────────────────────────────────────────────────
 run --gog-dir "$TMP_DIR" --output-dir "$TMP_DIR/out" --totally-bogus-flag
 assert_eq "1" "$RUN_EXIT" "unknown flag exits 1"

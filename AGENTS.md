@@ -99,8 +99,9 @@ external framework (bats/shellcheck are not assumed to be installed):
 Structure:
 
 - `tests/lib/assert.sh` — minimal assertion helpers (`assert_eq`,
-  `assert_success`, `assert_failure`, `assert_contains`, `assert_file_exists`,
-  …) plus `report_results`, which prints a per-file pass/fail summary and
+  `assert_success`, `assert_failure`, `assert_contains`, `assert_not_contains`,
+  `assert_file_exists`, …) plus `report_results`, which prints a per-file
+  pass/fail summary and
   returns non-zero on any failure. **Do not name a helper `print_summary`** —
   that collides with `ottercache`'s own `print_summary()` once a test file
   sources the script, silently replacing it.

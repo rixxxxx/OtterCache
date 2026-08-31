@@ -101,6 +101,7 @@ DIR_RUN=""
 HELPER_PY=""
 PY_ERROR_LOG=""
 SLUG_CACHE_FILE=""
+SLUG_OVERRIDES_FILE=""
 LOCK_FILE=""
 LOCK_FD=""
 TOTAL=0
@@ -120,6 +121,59 @@ def err(msg):
     """Log to stderr and exit non-zero."""
     print('PY_ERROR ' + sys.argv[1] + ': ' + msg, file=sys.stderr)
     sys.exit(1)
+
+
+# Shared by cmd_slug_candidates (slug generation), cmd_find_slug_in_results
+# and cmd_verify_slug_match (fuzzy name matching) — GOG titles and Lutris
+# names/slugs disagree on numerals ('Torchlight II' vs 'torchlight-2') often
+# enough that both sides need the same normalization.
+_ROMAN_TO_ARABIC = {
+    'i': '1', 'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6',
+    'vii': '7', 'viii': '8', 'ix': '9', 'x': '10', 'xi': '11', 'xii': '12',
+    'xiii': '13', 'xiv': '14', 'xv': '15', 'xvi': '16', 'xvii': '17',
+    'xviii': '18', 'xix': '19', 'xx': '20',
+}
+# Single-letter numerals (i, v, x) collide too easily with real words/
+# initials inside a title ('X-COM', 'Ico') to safely rewrite when building a
+# slug candidate — restrict the slug-generation swap to multi-letter
+# numerals. The full dict (including single letters) is still used for
+# token-overlap scoring below, where one stray token barely moves the score.
+_ROMAN_SLUG_PATTERN = re.compile(
+    r'\b(' + '|'.join(sorted((k for k in _ROMAN_TO_ARABIC if len(k) > 1),
+                              key=len, reverse=True)) + r')\b',
+    re.IGNORECASE,
+)
+
+# Common release/edition suffixes that GOG includes in the product title but
+# Lutris slugs/names usually omit (e.g. 'Foo: Definitive Edition' -> 'foo').
+_EDITION_SUFFIX_RE = re.compile(
+    r'\s*[:\-]?\s*(?:'
+    r'game of the year|goty|definitive|enhanced|special|deluxe|anniversary|'
+    r'ultimate|complete|extended|remastered|redux|gold'
+    r')(?:\s+edition)?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _tokenize(s):
+    s = re.sub(r'[™®†‡©]', '', s.lower())
+    tokens = set()
+    for t in re.split(r'[^a-z0-9]+', s):
+        if t:
+            tokens.add(_ROMAN_TO_ARABIC.get(t, t))
+    return tokens
+
+
+def _match_score(input_title, candidate_name):
+    """Token-overlap ratio (0.0-1.0) of candidate_name against input_title,
+    relative to input_title's token count. See cmd_verify_slug_match for the
+    threshold this is calibrated against."""
+    input_tokens = _tokenize(input_title)
+    candidate_tokens = _tokenize(candidate_name)
+    if not input_tokens or not candidate_tokens:
+        return 0.0
+    overlap = input_tokens & candidate_tokens
+    return len(overlap) / len(input_tokens)
 
 
 def cmd_url_to_filename():
@@ -206,7 +260,24 @@ def cmd_slug_candidates():
         re.sub(r'\s*:\s*.*$', '', re.sub(r'[™®†‡]', '', title)).strip(),  # drop subtitle
         re.sub(r'\s+\d+\b', '', title).strip(),                                      # drop trailing digits
         re.sub(r'\s*:\s*.*$', '', re.sub(r'\s+\d+\b', '', title)).strip(),           # drop subtitle + digits
+        _EDITION_SUFFIX_RE.sub('', title).strip(),                                   # drop edition suffix
     ]
+
+    # Derive extra variants per base variant: numerals swapped between roman
+    # and arabic, and '&' spelled out as 'and' — both are places where GOG
+    # titles and Lutris slugs commonly diverge (see docstring above).
+    expanded = []
+    for variant in variants:
+        if not variant:
+            continue
+        expanded.append(variant)
+        swapped = _ROMAN_SLUG_PATTERN.sub(
+            lambda m: _ROMAN_TO_ARABIC[m.group(1).lower()], variant)
+        if swapped != variant:
+            expanded.append(swapped)
+        if '&' in variant:
+            expanded.append(variant.replace('&', ' and '))
+    variants = expanded
 
     seen = set()
     for variant in variants:
@@ -286,7 +357,24 @@ def cmd_find_slug_in_results():
             if check(r):
                 print(r['slug'])
                 sys.exit(0)
-    print(results[0].get('slug', ''))
+
+    # None of the exact/prefix checks matched — an ambiguous search (e.g. a
+    # generic query returning many unrelated results). Previously this fell
+    # back to results[0] unconditionally, which silently picked whatever the
+    # API ranked first, regardless of relevance. Score every candidate by
+    # token overlap against the query instead, and only accept the best one
+    # if it clears the same 0.6 threshold cmd_verify_slug_match uses — an
+    # ambiguous search with no confident match is reported as 'not found'
+    # rather than guessed.
+    best_slug, best_score = '', 0.0
+    for r in results:
+        score = _match_score(query, r.get('name', ''))
+        if score > best_score:
+            best_slug, best_score = r.get('slug', ''), score
+    if best_slug and best_score >= 0.6:
+        print(best_slug)
+        sys.exit(0)
+    sys.exit(1)
 
 
 def cmd_parse_installers():
@@ -449,8 +537,8 @@ def cmd_verify_slug_match():
 
     Known false-negative risk:
       Titles where GOG omits spaces but Lutris keeps them (or vice versa)
-      tokenize differently. Roman-vs-Arabic numerals also don't match (II ≠ 2),
-      but the search-API fallback usually catches those.
+      tokenize differently. Roman-vs-Arabic numerals are normalized by
+      _tokenize() (II == 2), single-letter numerals (I, V, X) included.
     """
     inst_file = sys.argv[2]
     input_title = sys.argv[3]
@@ -469,18 +557,7 @@ def cmd_verify_slug_match():
     if not lutris_name:
         sys.exit(1)
 
-    def tokens(s):
-        s = re.sub(r'[\u2122\u00ae\u2020\u2021\u00a9]', '', s.lower())
-        return set(t for t in re.split(r'[^a-z0-9]+', s) if t)
-
-    input_tokens = tokens(input_title)
-    lutris_tokens = tokens(lutris_name)
-
-    if not input_tokens or not lutris_tokens:
-        sys.exit(1)
-
-    overlap = input_tokens & lutris_tokens
-    score = len(overlap) / len(input_tokens)
+    score = _match_score(input_title, lutris_name)
 
     # Diagnostic line for the py_errors.log — useful when reading the report.
     print('verify slug=' + str(installers[0].get('game_slug', '?'))
@@ -491,6 +568,24 @@ def cmd_verify_slug_match():
     if score >= 0.6:
         sys.exit(0)
     sys.exit(1)
+
+
+def cmd_override_get():
+    """Look up a manually-configured slug override for a normalized game
+    key. Lets a user hardcode 'this GOG title -> this Lutris slug' for
+    titles the automatic slug_candidates/search heuristics can't resolve
+    (e.g. a Lutris slug with no meaningful token/textual relation to the GOG
+    title at all). Prints nothing (not an error) if the key isn't present or
+    the file doesn't exist yet."""
+    try:
+        with open(sys.argv[2]) as f:
+            data = json.load(f)
+        value = data.get(sys.argv[3], '')
+        print(value if isinstance(value, str) else '')
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        err('cannot read slug overrides ' + sys.argv[2] + ': ' + str(e))
 
 
 def cmd_cache_get():
@@ -674,6 +769,7 @@ COMMANDS = {
     'save_installer_json':   cmd_save_installer_json,
     'save_installer_yaml':   cmd_save_installer_yaml,
     'verify_slug_match':     cmd_verify_slug_match,
+    'override_get':          cmd_override_get,
     'cache_get':             cmd_cache_get,
     'cache_check':           cmd_cache_check,
     'cache_update':          cmd_cache_update,
@@ -730,6 +826,9 @@ ${BOLD}OPTIONS:${NC}
       --prune-old            Remove outdated installer versions after fetching
       --prune-anyway         Force pruning even if errors occurred
       --api-delay  <sec>     Pause between API requests (default: 1)
+  -O, --slug-overrides <path>  JSON file mapping normalized GOG titles to
+                              Lutris slugs, for games the automatic slug
+                              resolution can't match (see README)
   -h, --help                 Show this help
 
 ${BOLD}NOTES:${NC}
@@ -754,6 +853,7 @@ parse_args() {
             --prune-old)      PRUNE_OLD=true;     shift   ;;
             --prune-anyway)   PRUNE_ANYWAY=true;  shift   ;;
             --api-delay)      API_DELAY="$2";     shift 2 ;;
+            -O|--slug-overrides) SLUG_OVERRIDES_FILE="$2"; shift 2 ;;
             -h|--help)        print_usage; exit 0         ;;
             *) log_error "Unknown argument: $1"; print_usage; exit 1 ;;
         esac
@@ -762,6 +862,8 @@ parse_args() {
     [[ -z "$GOG_DIR" ]]    && { log_error "--gog-dir is required";    print_usage; exit 1; }
     [[ -z "$OUTPUT_DIR" ]] && { log_error "--output-dir is required"; print_usage; exit 1; }
     [[ ! -d "$GOG_DIR" ]]  && { log_error "GOG directory not found: $GOG_DIR"; exit 1; }
+    [[ -n "$SLUG_OVERRIDES_FILE" && ! -f "$SLUG_OVERRIDES_FILE" ]] \
+        && { log_error "Slug overrides file not found: $SLUG_OVERRIDES_FILE"; exit 1; }
 
     if $PRUNE_ANYWAY && ! $PRUNE_OLD; then
         log_warn "--prune-anyway has no effect without --prune-old"
@@ -987,12 +1089,15 @@ detect_games() {
 
 # ── Slug resolution ───────────────────────────────────────────────────────────
 try_direct_slug() {
-    local candidate_slug="$1" tmp_file="$2"
+    local candidate_slug="$1" tmp_file="$2" game_name="$3"
     log_info "Trying direct slug: $candidate_slug"
     local code
     code=$(http_get "${LUTRIS_API}/games/${candidate_slug}/installers?format=json" "$tmp_file")
     [[ "$code" != "200" ]] && return 1
-    py has_game_id "$tmp_file"
+    py has_game_id "$tmp_file" || return 1
+    # Reject generic-slug false positives (e.g. 'star-wars' matching and
+    # swallowing 'Star Wars: Rebel Assault 1') via token-overlap scoring.
+    py verify_slug_match "$tmp_file" "$game_name"
 }
 
 resolve_slug_by_name() {
@@ -1013,12 +1118,28 @@ resolve_slug_by_name() {
 
 resolve_game_slug() {
     local game_name="$1"
-    local tmp slug=""
+    local slug=""
+
+    # Manual override takes precedence over any automatic resolution — it's
+    # a trusted, user-curated mapping for titles the heuristics below can't
+    # match (e.g. a Lutris slug with no textual relation to the GOG title).
+    if [[ -n "$SLUG_OVERRIDES_FILE" ]]; then
+        local override_key override_slug
+        override_key=$(normalize_key "$game_name")
+        override_slug=$(py override_get "$SLUG_OVERRIDES_FILE" "$override_key")
+        if [[ -n "$override_slug" ]]; then
+            log_info "Slug override matched: $override_slug"
+            echo "$override_slug"
+            return
+        fi
+    fi
+
+    local tmp
     tmp=$(mktemp /tmp/ottercache_XXXXXX.json)
 
     while IFS= read -r candidate; do
         [[ -z "$candidate" ]] && continue
-        if try_direct_slug "$candidate" "$tmp"; then
+        if try_direct_slug "$candidate" "$tmp" "$game_name"; then
             slug="$candidate"
             log_info "Direct slug matched: $slug"
             break

@@ -1,0 +1,9 @@
+{
+    "installers": [
+        {
+            "slug": "star-wars",
+            "name": "Star Wars",
+            "game_slug": "star-wars"
+        }
+    ]
+}

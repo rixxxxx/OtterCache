@@ -1,0 +1,6 @@
+{
+    "results": [
+        {"id": 1, "name": "Totally Unrelated Game", "slug": "totally-unrelated-game"},
+        {"id": 2, "name": "Another Random Title", "slug": "another-random-title"}
+    ]
+}

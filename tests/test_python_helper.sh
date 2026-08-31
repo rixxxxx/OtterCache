@@ -53,6 +53,22 @@ assert_contains "$tm_out" "fallout-tacticstm" \
 assert_contains "$tm_out" "fallout-tactics" \
     "slug_candidates emits the trademark-stripped variant"
 
+roman_out=$(py slug_candidates "Torchlight II")
+assert_contains "$roman_out" "torchlight-ii" \
+    "slug_candidates keeps the roman-numeral slug as-is"
+assert_contains "$roman_out" "torchlight-2" \
+    "slug_candidates emits the arabic-numeral variant for a roman numeral"
+
+ampersand_out=$(py slug_candidates "Dungeons & Dragons: Dark Alliance")
+assert_contains "$ampersand_out" "dungeons-dragons-dark-alliance" \
+    "slug_candidates emits the '&'-stripped variant"
+assert_contains "$ampersand_out" "dungeons-and-dragons-dark-alliance" \
+    "slug_candidates emits the '&'-spelled-out-as-'and' variant"
+
+edition_out=$(py slug_candidates "The Witcher 3: Wild Hunt - Game of the Year Edition")
+assert_contains "$edition_out" "the-witcher-3-wild-hunt" \
+    "slug_candidates drops a trailing 'Game of the Year Edition' suffix"
+
 # ── search_names ────────────────────────────────────────────────────────────
 names_out=$(py search_names "Fallout (1997)")
 assert_eq "2" "$(echo "$names_out" | grep -c .)" \
@@ -88,6 +104,36 @@ assert_failure "has_game_id fails when there is no id field" \
 assert_eq "sample-game" \
     "$(py find_slug_in_results "Sample Game" "$FIXTURES/search_results_sample.json")" \
     "find_slug_in_results matches on exact slug"
+
+assert_failure "find_slug_in_results rejects an ambiguous search with no confident match" \
+    py find_slug_in_results "My Specific Game Name" "$FIXTURES/search_results_ambiguous.json"
+assert_eq "" \
+    "$(py find_slug_in_results "My Specific Game Name" "$FIXTURES/search_results_ambiguous.json" 2>/dev/null)" \
+    "find_slug_in_results prints nothing for an ambiguous search (no results[0] guess)"
+
+assert_eq "star-wars-rebel-assault-collection" \
+    "$(py find_slug_in_results "Rebel Assault I & II" "$FIXTURES/search_results_fuzzy.json")" \
+    "find_slug_in_results falls back to the best token-overlap match above threshold"
+
+# ── verify_slug_match ────────────────────────────────────────────────────────
+assert_success "verify_slug_match accepts a close name match" \
+    py verify_slug_match "$FIXTURES/installers_sample.json" "Sample Game"
+
+assert_failure "verify_slug_match rejects a generic slug swallowing a specific title" \
+    py verify_slug_match "$FIXTURES/installers_generic_slug.json" "Star Wars Rebel Assault 1"
+
+# ── override_get ─────────────────────────────────────────────────────────────
+assert_eq "beneath-a-steel-sky" \
+    "$(py override_get "$FIXTURES/slug_overrides_sample.json" "beneath a steel sky")" \
+    "override_get returns the mapped slug for a known key"
+
+assert_eq "" \
+    "$(py override_get "$FIXTURES/slug_overrides_sample.json" "some other game")" \
+    "override_get returns empty for an unmapped key"
+
+assert_eq "" \
+    "$(py override_get "$TMP_DIR/does-not-exist.json" "beneath a steel sky")" \
+    "override_get returns empty (not an error) when the overrides file doesn't exist yet"
 
 # ── parse_installers ─────────────────────────────────────────────────────────
 installers_out=$(py parse_installers "$FIXTURES/installers_sample.json")

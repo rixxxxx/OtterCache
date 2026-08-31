@@ -38,6 +38,15 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local haystack="$1" needle="$2" desc="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        _pass "$desc"
+    else
+        _fail "$desc — did not expect to find [$needle] in [$haystack]"
+    fi
+}
+
 assert_success() {
     local desc="$1"; shift
     if "$@" >/dev/null 2>&1; then

@@ -124,6 +124,7 @@ ottercache.sh --gog-dir <path> --output-dir <path> [OPTIONS]
 | `-q`, `--quiet` | Suppress all output except errors and the final summary |
 | `--no-resources` | Fetch installer scripts only, skip deeplink downloads |
 | `--api-delay <sec>` | Pause between API requests (default: `1`) |
+| `-O`, `--slug-overrides <path>` | JSON file mapping GOG titles to Lutris slugs (see [Slug resolution](#slug-resolution)) |
 | `-h`, `--help` | Show help |
 
 ### Examples
@@ -206,6 +207,25 @@ Once `ottercache` has completed, install a game fully offline:
 3. **Subdirectory names** — last resort fallback
 
 Games are deduplicated at two levels: by normalized title (case-insensitive) and by Lutris slug, so no game is processed twice even if it appears under different names across sources.
+
+## Slug resolution
+
+GOG product titles and Lutris slugs often don't match textually. `ottercache` resolves a slug for each detected game through, in order:
+
+1. **Direct slug candidates** — the title is transformed into a handful of slug-shaped guesses (dropping `(YYYY)`, subtitles, trademark symbols, edition suffixes like "Definitive Edition", and swapping roman/arabic numerals or `&`/`and`), and each is tried directly against `games/<slug>/installers`. A match is only accepted if the returned game name has enough token overlap with the GOG title (≥ 60%) — this rejects generic slugs like `star-wars` silently swallowing a specific title like *Star Wars: Rebel Assault 1*.
+2. **Name search fallback** — if no direct candidate matches, the title (and a year-stripped variant) is searched via `games?search=`. Exact slug/name matches win; if none exist, the best token-overlap match is used, but only if it also clears the 60% threshold. An ambiguous search with no confident match is reported as "not found" rather than guessed.
+3. **Manual overrides** (`--slug-overrides <path>`) — checked *before* steps 1–2. Point it at a JSON file mapping normalized GOG titles to Lutris slugs:
+
+   ```json
+   {
+     "beneath a steel sky": "beneath-a-steel-sky",
+     "the witcher 3 wild hunt goty edition": "the-witcher-3-wild-hunt"
+   }
+   ```
+
+   Keys must be normalized the same way `ottercache` normalizes titles internally: lowercased, whitespace collapsed. Use this for titles where the GOG name and Lutris slug have no meaningful textual relationship the automatic heuristics could ever bridge.
+
+If a game still can't be resolved, it's listed under "Skipped games" in the run summary with the reason (not found / API error) — add an override entry for it and re-run.
 
 ## Reports
 
