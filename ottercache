@@ -155,6 +155,15 @@ _ROMAN_SLUG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# The reverse direction (GOG title has an arabic sequel number, Lutris slug
+# uses roman numerals instead, e.g. 'Rebel Assault 2' -> 'rebel-assault-ii').
+# Digits carry no letter-collision risk the way single-letter romans do, so
+# the full 1-20 range is safe to include here (unlike _ROMAN_SLUG_PATTERN).
+_ARABIC_TO_ROMAN = {v: k for k, v in _ROMAN_TO_ARABIC.items()}
+_ARABIC_SLUG_PATTERN = re.compile(
+    r'\b(' + '|'.join(sorted(_ARABIC_TO_ROMAN, key=len, reverse=True)) + r')\b'
+)
+
 # Common release/edition suffixes that GOG includes in the product title but
 # Lutris slugs/names usually omit (e.g. 'Foo: Definitive Edition' -> 'foo').
 _EDITION_SUFFIX_RE = re.compile(
@@ -301,10 +310,14 @@ def cmd_slug_candidates():
         if not variant:
             continue
         expanded.append(variant)
-        swapped = _ROMAN_SLUG_PATTERN.sub(
+        roman_swapped = _ROMAN_SLUG_PATTERN.sub(
             lambda m: _ROMAN_TO_ARABIC[m.group(1).lower()], variant)
-        if swapped != variant:
-            expanded.append(swapped)
+        if roman_swapped != variant:
+            expanded.append(roman_swapped)
+        arabic_swapped = _ARABIC_SLUG_PATTERN.sub(
+            lambda m: _ARABIC_TO_ROMAN[m.group(1)], variant)
+        if arabic_swapped != variant:
+            expanded.append(arabic_swapped)
         if '&' in variant:
             expanded.append(variant.replace('&', ' and '))
     variants = expanded

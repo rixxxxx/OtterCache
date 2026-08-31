@@ -59,6 +59,15 @@ assert_contains "$roman_out" "torchlight-ii" \
 assert_contains "$roman_out" "torchlight-2" \
     "slug_candidates emits the arabic-numeral variant for a roman numeral"
 
+# Reverse direction: GOG uses an arabic sequel number, Lutris uses roman
+# numerals (real-world case: "Star Wars: Rebel Assault 2" is
+# lutris.net/games/star-wars-rebel-assault-ii).
+arabic_out=$(py slug_candidates "Star Wars: Rebel Assault 2")
+assert_contains "$arabic_out" "star-wars-rebel-assault-2" \
+    "slug_candidates keeps the arabic-numeral slug as-is"
+assert_contains "$arabic_out" "star-wars-rebel-assault-ii" \
+    "slug_candidates emits the roman-numeral variant for an arabic numeral"
+
 ampersand_out=$(py slug_candidates "Dungeons & Dragons: Dark Alliance")
 assert_contains "$ampersand_out" "dungeons-dragons-dark-alliance" \
     "slug_candidates emits the '&'-stripped variant"
