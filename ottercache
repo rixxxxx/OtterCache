@@ -175,7 +175,7 @@ _DESCRIPTOR_WORDS = (
     'game of the year', 'goty', 'definitive', 'enhanced', 'special',
     'deluxe', 'anniversary', 'ultimate', 'complete', 'extended',
     'remastered', 'redux', 'gold', 'remake', 'reboot', 'reimagined',
-    'classic',
+    'classic', 'unlimited',
 )
 _EDITION_SUFFIX_RE = re.compile(
     r'\s*[:\-]?\s*(?:' + '|'.join(_DESCRIPTOR_WORDS) + r')(?:\s+edition)?\s*$',
@@ -311,6 +311,7 @@ def cmd_slug_candidates():
         re.sub(r'\s+\d+\b', '', title).strip(),                                      # drop trailing digits
         re.sub(r'\s*:\s*.*$', '', re.sub(r'\s+\d+\b', '', title)).strip(),           # drop subtitle + digits
         _EDITION_SUFFIX_RE.sub('', title).strip(),                                   # drop edition suffix
+        _EDITION_SUFFIX_RE.sub('', re.sub(r'[™®†‡©]', '', title)).strip(),           # drop edition suffix after tm/(r)
     ]
 
     # Derive extra variants per base variant: numerals swapped between roman

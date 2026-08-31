@@ -82,6 +82,14 @@ remake_out=$(py slug_candidates "XIII Remake")
 assert_contains "$remake_out" "xiii" \
     "slug_candidates drops a trailing 'Remake' with no colon/parens separator"
 
+tm_edition_out=$(py slug_candidates "Dungeon Keeper Gold™")
+assert_contains "$tm_edition_out" "dungeon-keeper" \
+    "slug_candidates drops an edition-suffix word that's followed by a trademark symbol"
+
+unlimited_out=$(py slug_candidates "SimCity™ 3000 Unlimited")
+assert_contains "$unlimited_out" "simcity-3000" \
+    "slug_candidates drops a trailing 'Unlimited' suffix"
+
 # ── search_names ────────────────────────────────────────────────────────────
 names_out=$(py search_names "Fallout (1997)")
 assert_eq "2" "$(echo "$names_out" | grep -c .)" \
