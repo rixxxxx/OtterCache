@@ -78,6 +78,10 @@ edition_out=$(py slug_candidates "The Witcher 3: Wild Hunt - Game of the Year Ed
 assert_contains "$edition_out" "the-witcher-3-wild-hunt" \
     "slug_candidates drops a trailing 'Game of the Year Edition' suffix"
 
+remake_out=$(py slug_candidates "XIII Remake")
+assert_contains "$remake_out" "xiii" \
+    "slug_candidates drops a trailing 'Remake' with no colon/parens separator"
+
 # ── search_names ────────────────────────────────────────────────────────────
 names_out=$(py search_names "Fallout (1997)")
 assert_eq "2" "$(echo "$names_out" | grep -c .)" \
@@ -130,6 +134,13 @@ assert_success "verify_slug_match accepts a close name match" \
 
 assert_failure "verify_slug_match rejects a generic slug swallowing a specific title" \
     py verify_slug_match "$FIXTURES/installers_generic_slug.json" "Star Wars Rebel Assault 1"
+
+# Real-world case: GOG's "XIII Remake" vs Lutris's plain "XIII" (lutris.net/
+# games/xiii/) — "Remake" is a generic descriptor Lutris omits entirely, and
+# must not count against the match (previously scored 0.50, just under the
+# 0.6 threshold, and got wrongly rejected).
+assert_success "verify_slug_match ignores a generic descriptor word ('Remake') absent from the Lutris name" \
+    py verify_slug_match "$FIXTURES/installers_xiii.json" "XIII Remake"
 
 # ── override_get ─────────────────────────────────────────────────────────────
 assert_eq "beneath-a-steel-sky" \

@@ -1,0 +1,9 @@
+{
+    "installers": [
+        {
+            "slug": "xiii",
+            "name": "XIII",
+            "game_slug": "xiii"
+        }
+    ]
+}

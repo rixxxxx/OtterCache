@@ -164,22 +164,33 @@ _ARABIC_SLUG_PATTERN = re.compile(
     r'\b(' + '|'.join(sorted(_ARABIC_TO_ROMAN, key=len, reverse=True)) + r')\b'
 )
 
-# Common release/edition suffixes that GOG includes in the product title but
-# Lutris slugs/names usually omit (e.g. 'Foo: Definitive Edition' -> 'foo').
+# Common release-descriptor words GOG includes in the product title but
+# Lutris slugs/names usually omit (e.g. 'Foo: Definitive Edition' -> 'foo',
+# 'XIII Remake' -> 'XIII'). Shared by _EDITION_SUFFIX_RE (candidate
+# generation: strip these off the end to produce a shorter slug candidate)
+# and _DESCRIPTOR_STOPWORDS (scoring: ignore these words entirely on both
+# sides of the token-overlap comparison, so a GOG title that adds a generic
+# descriptor the Lutris name lacks isn't unfairly penalized for it).
+_DESCRIPTOR_WORDS = (
+    'game of the year', 'goty', 'definitive', 'enhanced', 'special',
+    'deluxe', 'anniversary', 'ultimate', 'complete', 'extended',
+    'remastered', 'redux', 'gold', 'remake', 'reboot', 'reimagined',
+    'classic',
+)
 _EDITION_SUFFIX_RE = re.compile(
-    r'\s*[:\-]?\s*(?:'
-    r'game of the year|goty|definitive|enhanced|special|deluxe|anniversary|'
-    r'ultimate|complete|extended|remastered|redux|gold'
-    r')(?:\s+edition)?\s*$',
+    r'\s*[:\-]?\s*(?:' + '|'.join(_DESCRIPTOR_WORDS) + r')(?:\s+edition)?\s*$',
     re.IGNORECASE,
 )
+_DESCRIPTOR_STOPWORDS = {'edition'} | {
+    w for phrase in _DESCRIPTOR_WORDS for w in phrase.split(' ')
+}
 
 
 def _tokenize(s):
     s = re.sub(r'[™®†‡©]', '', s.lower())
     tokens = set()
     for t in re.split(r'[^a-z0-9]+', s):
-        if t:
+        if t and t not in _DESCRIPTOR_STOPWORDS:
             tokens.add(_ROMAN_TO_ARABIC.get(t, t))
     return tokens
 
