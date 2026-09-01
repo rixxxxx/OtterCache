@@ -1146,6 +1146,11 @@ curl_with_retry() {
         code="${code:-000}"
         is_retryable_http_code "$code" || break
         [[ "$attempt" -eq "$MAX_ATTEMPTS" ]] && break
+        # A caller may be mid-line (e.g. download_resource's "[CHECK] <file> "
+        # printf with no trailing newline, waiting to append the final status
+        # right after) -- break onto a fresh line first so this warning
+        # doesn't get glued onto the end of that in-progress line.
+        echo >&2
         log_warn "  Transient HTTP $code — retry $attempt/$((MAX_ATTEMPTS - 1)) in $((RETRY_BACKOFF_BASE ** attempt))s"
         sleep "$((RETRY_BACKOFF_BASE ** attempt))"
     done
