@@ -9,7 +9,8 @@
       "Bash(bash -n ottercache)",
       "Bash(rtk grep *)",
       "WebFetch(domain:lutris.net)",
-      "WebFetch(domain:gog.com)"
+      "WebFetch(domain:gog.com)",
+      "Bash(./tests/run_tests.sh)"
     ]
   }
 }

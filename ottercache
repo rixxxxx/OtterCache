@@ -48,6 +48,11 @@ set -uo pipefail
 # ── Constants ─────────────────────────────────────────────────────────────────
 readonly LUTRIS_API="https://lutris.net/api"
 readonly USER_AGENT="Mozilla/5.0 (X11; Linux x86_64)"
+# Shared curl flag groups, referenced via "${CURL_BASE_OPTS[@]}" /
+# "${CURL_REDIRECT_OPTS[@]}" by every curl-calling function below instead of
+# each hand-repeating the same flags.
+readonly -a CURL_BASE_OPTS=(--user-agent "$USER_AGENT")
+readonly -a CURL_REDIRECT_OPTS=(--location --max-redirs 5)
 readonly CURL_TIMEOUT=15
 # DOWNLOAD_TIMEOUT is now just an outer safety net against pathological
 # hangs (e.g. a connection that limps along at 1 byte every 59s forever) --
@@ -91,10 +96,16 @@ declare -a SKIPPED_GAMES=()
 declare -a DUPLICATE_SLUGS=()
 declare -a SUCCESS_INSTALLERS=()
 declare -a CACHED_INSTALLERS=()
-declare -a LOCALIZED_YAMLS=()
 declare -a PRUNED_DIRS=()
 declare -a YAML_GENERATION_FAILURES=()
 declare -i API_ERROR_COUNT=0
+
+# SKIPPED_GAMES reason tags -- named so the 5 bracket-tag strings written in
+# process_game() aren't hand-retyped at each call site.
+readonly SKIP_FULLY_CACHED='[fully cached, use --force to refresh]'
+readonly SKIP_API_UNREACHABLE='[API unreachable]'
+readonly SKIP_NOT_FOUND='[not found on lutris.net]'
+readonly SKIP_NO_INSTALLERS='[no installers on lutris.net]'
 declare -i HELPER_ERROR_COUNT=0
 
 GOG_DIR=""
@@ -129,9 +140,60 @@ import urllib.parse
 
 
 def err(msg):
-    """Log to stderr and exit non-zero."""
+    """Log to stderr and exit with a code reserved for genuine helper
+    failures (bad args, unreadable/invalid input, missing dependency, ...).
+    Exit codes 0/1 stay free for commands with a designed boolean-answer
+    protocol (has_game_id, find_slug_in_results, verify_slug_match,
+    cache_check) so a real error is never confused with a legitimate
+    'false' answer."""
     print('PY_ERROR ' + sys.argv[1] + ': ' + msg, file=sys.stderr)
-    sys.exit(1)
+    sys.exit(2)
+
+
+def warn(msg):
+    """Log to stderr without exiting -- for non-fatal, caller-handled issues.
+    Sibling to err(); use this instead of hand-rolling a 'PY_WARN <cmd>: ...'
+    string at the call site."""
+    print('PY_WARN ' + sys.argv[1] + ': ' + msg, file=sys.stderr)
+
+
+def _require_argc(n):
+    """Guard against a bash call-site arg-count bug surfacing as a raw
+    Python IndexError traceback instead of a clean PY_ERROR line. n is the
+    minimum total sys.argv length (script + command + positional args)."""
+    if len(sys.argv) < n:
+        err('expected at least {} argument(s), got {}'.format(
+            n - 2, max(0, len(sys.argv) - 2)))
+
+
+def _load_json(path):
+    """Shared json.load-with-error-handling. Raises via err() (exits) on any
+    read/parse failure -- callers only need to handle the success path."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        err('cannot read ' + path + ': ' + str(e))
+
+
+def _find_installer_by_slug(data, target_slug):
+    """Returns the installer dict matching target_slug from an
+    installers-list API response, or None if not present."""
+    for inst in data.get('installers', []):
+        if inst.get('slug') == target_slug:
+            return inst
+    return None
+
+
+# Match-score threshold shared by cmd_find_slug_in_results (search-result
+# fallback) and cmd_verify_slug_match (direct-slug acceptance) -- see
+# cmd_verify_slug_match's docstring for how this was calibrated.
+MATCH_THRESHOLD = 0.6
+
+# Lutris installer spec's required top-level fields, per docs/installers.rst.
+# Shared by cmd_save_installer_yaml (generates them) and cmd_localize_yaml
+# (re-validates them survived the round-trip).
+REQUIRED_TOP_LEVEL_FIELDS = ('name', 'game_slug', 'slug', 'runner')
 
 
 # Shared by cmd_slug_candidates (slug generation), cmd_find_slug_in_results
@@ -230,6 +292,7 @@ def _resource_urls(installer):
 
 
 def cmd_url_to_filename():
+    _require_argc(3)
     print(_url_to_filename(sys.argv[2]))
 
 
@@ -245,6 +308,7 @@ def cmd_product_title():
     fine but the title field is unusable. Only hard-errors when the file
     itself cannot be read or parsed.
     """
+    _require_argc(3)
     path = sys.argv[2]
     d = None
     try:
@@ -294,6 +358,7 @@ def cmd_slug_candidates():
        matched Lutris name to reject false positives (e.g. 'star-wars'
        swallowing 'Star Wars: Rebel Assault 1').
     """
+    _require_argc(3)
     title = sys.argv[2].strip()
 
     def to_slug_strip(s):
@@ -345,6 +410,7 @@ def cmd_slug_candidates():
 
 
 def cmd_search_names():
+    _require_argc(3)
     title = sys.argv[2].strip()
     seen = []
     candidates = [
@@ -361,22 +427,25 @@ def cmd_search_names():
 def cmd_has_game_id():
     """Boolean check: exit 0 if installer has an 'id' field, else exit 1.
     Errors during read also return exit 1 (treated as 'no'), but log to stderr."""
+    _require_argc(3)
     try:
         with open(sys.argv[2]) as f:
             d = json.load(f)
         sys.exit(0 if d.get('id') else 1)
     except Exception as e:
-        print('PY_WARN has_game_id: ' + str(e), file=sys.stderr)
+        warn(str(e))
         sys.exit(1)
 
 
 def cmd_url_encode():
+    _require_argc(3)
     print(urllib.parse.quote(sys.argv[2]))
 
 
 def cmd_extract_gog_id():
     """Replacement for grep -P. Extracts a 9-10 digit GOG ID surrounded by
     word boundaries or common separator characters."""
+    _require_argc(3)
     filename = sys.argv[2]
     pattern = r'(?:^|[\[(\s_.\-])(\d{9,10})(?:[\])\s_.\-]|$)'
     m = re.search(pattern, filename)
@@ -385,17 +454,14 @@ def cmd_extract_gog_id():
 
 
 def cmd_find_slug_in_results():
+    _require_argc(4)
     query = sys.argv[2].lower().strip()
     results_file = sys.argv[3]
     query_slug = re.sub(r'[^a-z0-9]+', '-', query).strip('-')
     query_noyear = re.sub(r'-\d{4}$', '', query_slug)
     query_noyear_name = re.sub(r'\s*\(\d{4}\)\s*$', '', query).strip()
 
-    try:
-        with open(results_file) as f:
-            results = json.load(f).get('results', [])
-    except Exception as e:
-        err('cannot read ' + results_file + ': ' + str(e))
+    results = _load_json(results_file).get('results', [])
 
     if not results:
         sys.exit(1)
@@ -426,18 +492,15 @@ def cmd_find_slug_in_results():
         score = _match_score(query, r.get('name', ''))
         if score > best_score:
             best_slug, best_score = r.get('slug', ''), score
-    if best_slug and best_score >= 0.6:
+    if best_slug and best_score >= MATCH_THRESHOLD:
         print(best_slug)
         sys.exit(0)
     sys.exit(1)
 
 
 def cmd_parse_installers():
-    try:
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
-    except Exception as e:
-        err('cannot read ' + sys.argv[2] + ': ' + str(e))
+    _require_argc(3)
+    data = _load_json(sys.argv[2])
 
     for inst in data.get('installers', []):
         slug = inst.get('slug', '')
@@ -449,41 +512,33 @@ def cmd_parse_installers():
 
 
 def cmd_extract_urls():
+    _require_argc(4)
     target_slug = sys.argv[3]
-    try:
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
-    except Exception as e:
-        err('cannot read ' + sys.argv[2] + ': ' + str(e))
+    data = _load_json(sys.argv[2])
 
-    for inst in data.get('installers', []):
-        if inst.get('slug') != target_slug:
-            continue
-        for url in _resource_urls(inst):
-            print(url)
+    inst = _find_installer_by_slug(data, target_slug)
+    if inst is None:
+        return
+    for url in _resource_urls(inst):
+        print(url)
 
 
 def cmd_save_installer_json():
+    _require_argc(5)
     target_slug = sys.argv[3]
     dest_dir = sys.argv[4]
+    data = _load_json(sys.argv[2])
+
+    inst = _find_installer_by_slug(data, target_slug)
+    if inst is None:
+        err('installer slug not found in API response: ' + target_slug)
+
+    fname = re.sub(r'[^\w\-.]', '_', target_slug) + '.json'
     try:
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
+        with open(os.path.join(dest_dir, fname), 'w') as f:
+            json.dump(inst, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        err('cannot read ' + sys.argv[2] + ': ' + str(e))
-
-    for inst in data.get('installers', []):
-        if inst.get('slug') != target_slug:
-            continue
-        fname = re.sub(r'[^\w\-.]', '_', target_slug) + '.json'
-        try:
-            with open(os.path.join(dest_dir, fname), 'w') as f:
-                json.dump(inst, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            err('cannot write JSON to ' + dest_dir + ': ' + str(e))
-        return
-
-    err('installer slug not found in API response: ' + target_slug)
+        err('cannot write JSON to ' + dest_dir + ': ' + str(e))
 
 
 def cmd_save_installer_yaml():
@@ -499,6 +554,7 @@ def cmd_save_installer_yaml():
     and force string types to avoid YAML number coercion (Lutris issue #4365:
     a 'version: 012' line is parsed as octal 10 and locks the dialog).
     """
+    _require_argc(5)
     try:
         import yaml
     except ImportError:
@@ -506,61 +562,53 @@ def cmd_save_installer_yaml():
 
     target_slug = sys.argv[3]
     dest_file = sys.argv[4]
+    data = _load_json(sys.argv[2])
+
+    inst = _find_installer_by_slug(data, target_slug)
+    if inst is None:
+        err('installer slug not found in API response: ' + target_slug)
+
+    content = inst.get('content', '')
+    try:
+        parsed = yaml.safe_load(content) if content else {}
+    except yaml.YAMLError as e:
+        err('invalid YAML in API content: ' + str(e))
+
+    # Heuristic: if the parsed content already exposes a 'script' key at
+    # the top level, the API delivered a full document. Otherwise treat
+    # the parsed content as the script body itself.
+    if isinstance(parsed, dict) and 'script' in parsed:
+        full = parsed
+    else:
+        full = {'script': parsed if isinstance(parsed, dict) else {}}
+
+    # Required top-level fields per Lutris installer spec, plus 'version'
+    # (not itself required, but always force-copied alongside the required
+    # ones). Force string type to defeat YAML scalar inference.
+    for field in REQUIRED_TOP_LEVEL_FIELDS + ('version',):
+        value = inst.get(field)
+        if value is not None:
+            full[field] = str(value)
+
+    # Optional but spec-compliant metadata, preserved if present.
+    for field in ('description', 'notes', 'year', 'steamid', 'gogid',
+                  'humbleid', 'humblestoreid', 'gogslug', 'installer_slug'):
+        v = inst.get(field)
+        if v not in (None, ''):
+            full[field] = v
+
+    # Sanity check: refuse to write a useless YAML.
+    missing = [f for f in REQUIRED_TOP_LEVEL_FIELDS if not full.get(f)]
+    if missing:
+        err('installer ' + target_slug + ' missing required fields: '
+            + ', '.join(missing))
 
     try:
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
+        with open(dest_file, 'w') as f:
+            yaml.dump(full, f, default_flow_style=False,
+                      allow_unicode=True, sort_keys=False)
     except Exception as e:
-        err('cannot read installer JSON: ' + str(e))
-
-    for inst in data.get('installers', []):
-        if inst.get('slug') != target_slug:
-            continue
-
-        content = inst.get('content', '')
-        try:
-            parsed = yaml.safe_load(content) if content else {}
-        except yaml.YAMLError as e:
-            err('invalid YAML in API content: ' + str(e))
-
-        # Heuristic: if the parsed content already exposes a 'script' key at
-        # the top level, the API delivered a full document. Otherwise treat
-        # the parsed content as the script body itself.
-        if isinstance(parsed, dict) and 'script' in parsed:
-            full = parsed
-        else:
-            full = {'script': parsed if isinstance(parsed, dict) else {}}
-
-        # Required top-level fields per Lutris installer spec.
-        # Force string type to defeat YAML scalar inference.
-        for field in ('name', 'game_slug', 'version', 'slug', 'runner'):
-            value = inst.get(field)
-            if value is not None:
-                full[field] = str(value)
-
-        # Optional but spec-compliant metadata, preserved if present.
-        for field in ('description', 'notes', 'year', 'steamid', 'gogid',
-                      'humbleid', 'humblestoreid', 'gogslug', 'installer_slug'):
-            v = inst.get(field)
-            if v not in (None, ''):
-                full[field] = v
-
-        # Sanity check: refuse to write a useless YAML.
-        missing = [f for f in ('name', 'game_slug', 'slug', 'runner')
-                   if not full.get(f)]
-        if missing:
-            err('installer ' + target_slug + ' missing required fields: '
-                + ', '.join(missing))
-
-        try:
-            with open(dest_file, 'w') as f:
-                yaml.dump(full, f, default_flow_style=False,
-                          allow_unicode=True, sort_keys=False)
-        except Exception as e:
-            err('cannot write YAML to ' + dest_file + ': ' + str(e))
-        return
-
-    err('installer slug not found in API response: ' + target_slug)
+        err('cannot write YAML to ' + dest_file + ': ' + str(e))
 
 
 def cmd_verify_slug_match():
@@ -589,14 +637,10 @@ def cmd_verify_slug_match():
       tokenize differently. Roman-vs-Arabic numerals are normalized by
       _tokenize() (II == 2), single-letter numerals (I, V, X) included.
     """
+    _require_argc(4)
     inst_file = sys.argv[2]
     input_title = sys.argv[3]
-
-    try:
-        with open(inst_file) as f:
-            data = json.load(f)
-    except Exception as e:
-        err('cannot read ' + inst_file + ': ' + str(e))
+    data = _load_json(inst_file)
 
     installers = data.get('installers', [])
     if not installers:
@@ -614,7 +658,7 @@ def cmd_verify_slug_match():
           + ' input="' + input_title + '"'
           + ' lutris="' + lutris_name + '"', file=sys.stderr)
 
-    if score >= 0.6:
+    if score >= MATCH_THRESHOLD:
         sys.exit(0)
     sys.exit(1)
 
@@ -626,6 +670,7 @@ def cmd_override_get():
     (e.g. a Lutris slug with no meaningful token/textual relation to the GOG
     title at all). Prints nothing (not an error) if the key isn't present or
     the file doesn't exist yet."""
+    _require_argc(4)
     try:
         with open(sys.argv[2]) as f:
             data = json.load(f)
@@ -638,6 +683,7 @@ def cmd_override_get():
 
 
 def cmd_cache_get():
+    _require_argc(4)
     try:
         with open(sys.argv[2]) as f:
             data = json.load(f)
@@ -662,9 +708,9 @@ def cmd_cache_check():
     missing). Reading the resource list from the *locally saved* JSON here
     (rather than the live API) keeps this check network-free.
     """
+    _require_argc(5)
     try:
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
+        data = _load_json(sys.argv[2])
         dirs = data.get(sys.argv[3], {}).get('dirs', [])
         outdir = sys.argv[4]
         no_resources = len(sys.argv) > 5 and sys.argv[5] == 'true'
@@ -691,11 +737,12 @@ def cmd_cache_check():
     except SystemExit:
         raise
     except Exception as e:
-        print('PY_WARN cache_check: ' + str(e), file=sys.stderr)
+        warn(str(e))
         sys.exit(1)
 
 
 def cmd_cache_update():
+    _require_argc(5)
     cache_file = sys.argv[2]
     key = sys.argv[3]
     slug = sys.argv[4]
@@ -717,6 +764,7 @@ def cmd_cache_update():
 
 
 def cmd_find_outdated():
+    _require_argc(3)
     output_dir = sys.argv[2]
     date_re = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})_(.+)$')
     groups = {}
@@ -746,6 +794,7 @@ def cmd_find_outdated():
 
 
 def cmd_prune_preview():
+    _require_argc(3)
     try:
         data = json.loads(sys.argv[2])
     except json.JSONDecodeError as e:
@@ -756,6 +805,7 @@ def cmd_prune_preview():
 
 
 def cmd_prune_apply():
+    _require_argc(4)
     try:
         data = json.loads(sys.argv[2])
     except json.JSONDecodeError as e:
@@ -768,11 +818,11 @@ def cmd_prune_apply():
                 shutil.rmtree(os.path.join(outdir, old))
                 print(old)
             except Exception as e:
-                print('PY_WARN prune_apply ' + old + ': ' + str(e),
-                      file=sys.stderr)
+                warn(old + ': ' + str(e))
 
 
 def cmd_localize_yaml():
+    _require_argc(5)
     try:
         import yaml
     except ImportError:
@@ -790,8 +840,7 @@ def cmd_localize_yaml():
 
     # Sanity: require top-level fields to still exist after the roundtrip,
     # otherwise the offline YAML would be broken in Lutris.
-    missing = [f for f in ('name', 'game_slug', 'slug', 'runner')
-               if not data.get(f)]
+    missing = [f for f in REQUIRED_TOP_LEVEL_FIELDS if not data.get(f)]
     if missing:
         err(yaml_file + ' missing required top-level fields: '
             + ', '.join(missing))
@@ -868,19 +917,17 @@ PYEOF
 # Wrapper around the Python helper.
 # Stderr is redirected to a per-run log so that command substitutions
 # don't pollute returned values, while errors remain visible after the run.
+# Exit codes >=2 are genuine helper failures (see err() in the heredoc) --
+# 0/1 stay free for commands with a designed boolean-answer protocol, so
+# only >=2 counts toward HELPER_ERROR_COUNT. That split is what makes
+# unconditional tracking here safe: without it, every ordinary "no match
+# found" (a legitimate exit 1) would inflate the counter into noise.
 py() {
+    local rc
     python3 "$HELPER_PY" "$@" 2>>"$PY_ERROR_LOG"
-}
-
-# Same as py(), but counts non-zero exits in HELPER_ERROR_COUNT.
-# Use this for calls where stderr loss in $() is acceptable but exit-code
-# handling matters.
-py_tracked() {
-    if py "$@"; then
-        return 0
-    fi
-    HELPER_ERROR_COUNT=$((HELPER_ERROR_COUNT + 1))
-    return 1
+    rc=$?
+    [[ "$rc" -ge 2 ]] && HELPER_ERROR_COUNT=$((HELPER_ERROR_COUNT + 1))
+    return "$rc"
 }
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
@@ -1090,15 +1137,15 @@ http_get() {
     curl_with_retry -s -o "$out_file" -w "%{http_code}" \
         --max-time "$CURL_TIMEOUT" \
         --header "Accept: application/json" \
-        --user-agent "$USER_AGENT" \
+        "${CURL_BASE_OPTS[@]}" \
         "$url"
 }
 
 check_url_status() {
     curl_with_retry -s -o /dev/null -w "%{http_code}" \
         --max-time "$CURL_TIMEOUT" \
-        --location --max-redirs 5 \
-        --user-agent "$USER_AGENT" \
+        "${CURL_REDIRECT_OPTS[@]}" \
+        "${CURL_BASE_OPTS[@]}" \
         "$1"
 }
 
@@ -1252,7 +1299,7 @@ resolve_game_slug() {
             local result rc
             result=$(resolve_slug_by_name "$search_name" "$tmp"); rc=$?
             if [[ "$rc" -eq 2 ]]; then
-                rm -f "$tmp"; echo "API_ERROR"; return
+                rm -f "$tmp"; return 2
             fi
             if [[ -n "$result" ]]; then
                 slug="$result"; break
@@ -1277,7 +1324,7 @@ make_dir_name() {
 }
 
 # ── Resource handling ─────────────────────────────────────────────────────────
-print_url_status() {
+record_url_status() {
     local fname="$1" http_code="$2" dir_name="$3" url="$4"
     case "$http_code" in
         200|206) echo -e "${GREEN}${http_code} OK${NC}" >&2 ;;
@@ -1301,8 +1348,16 @@ print_url_status() {
 
 check_resources_dry_run() {
     local data_file="$1" installer_slug="$2" dir_name="$3"
-    local urls=()
-    mapfile -t urls < <(py extract_urls "$data_file" "$installer_slug")
+    local urls_raw urls=()
+    urls_raw=$(py extract_urls "$data_file" "$installer_slug") || {
+        # py()'s own HELPER_ERROR_COUNT increment happens inside this
+        # command substitution's subshell and is lost when it exits --
+        # command substitution, like process substitution, always forks.
+        # Track it here in the caller's shell instead.
+        HELPER_ERROR_COUNT=$((HELPER_ERROR_COUNT + 1))
+        log_warn "Failed to extract resource URLs for $installer_slug – treating as none found"
+    }
+    [[ -n "$urls_raw" ]] && mapfile -t urls <<< "$urls_raw"
 
     if [[ "${#urls[@]}" -eq 0 ]]; then
         log_dryrun "  No deeplink resources"
@@ -1314,7 +1369,7 @@ check_resources_dry_run() {
         fname=$(py url_to_filename "$url")
         printf "  ${MAGENTA}[DRY-RUN]${NC}  %-45s " "$fname" >&2
         http_code=$(check_url_status "$url")
-        print_url_status "$fname" "$http_code" "$dir_name" "$url"
+        record_url_status "$fname" "$http_code" "$dir_name" "$url"
         sleep 0.2
     done
 }
@@ -1327,11 +1382,12 @@ check_resources_dry_run() {
 download_with_retry() {
     local url="$1" out_file="$2" attempt
     for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
-        curl -s -L \
+        curl -s \
             --max-time "$DOWNLOAD_TIMEOUT" \
             --speed-limit "$DOWNLOAD_MIN_SPEED" \
             --speed-time "$DOWNLOAD_STALL_TIME" \
-            --user-agent "$USER_AGENT" \
+            "${CURL_REDIRECT_OPTS[@]}" \
+            "${CURL_BASE_OPTS[@]}" \
             --output "$out_file" \
             "$url" 2>/dev/null && return 0
         [[ "$attempt" -eq "$MAX_ATTEMPTS" ]] && return 1
@@ -1348,9 +1404,10 @@ download_with_retry() {
 # callers must treat an empty result as "size unknown" and skip accordingly.
 probe_content_length() {
     local size
-    size=$(curl -s -o /dev/null -L --max-redirs 5 --head \
+    size=$(curl -s -o /dev/null --head \
         --max-time "$CURL_TIMEOUT" \
-        --user-agent "$USER_AGENT" \
+        "${CURL_REDIRECT_OPTS[@]}" \
+        "${CURL_BASE_OPTS[@]}" \
         -w "%{content_length}" \
         "$1" 2>/dev/null)
     [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]] && echo "$size"
@@ -1374,7 +1431,7 @@ download_resource() {
 
     printf "  ${BLUE}[CHECK]${NC} %-50s " "$fname" >&2
     http_code=$(check_url_status "$url")
-    print_url_status "$fname" "$http_code" "$dir_name" "$url"
+    record_url_status "$fname" "$http_code" "$dir_name" "$url"
 
     is_http_success "$http_code" || return
 
@@ -1405,8 +1462,16 @@ download_resource() {
 
 download_resources() {
     local data_file="$1" installer_slug="$2" inst_dir="$3" dir_name="$4"
-    local urls=()
-    mapfile -t urls < <(py extract_urls "$data_file" "$installer_slug")
+    local urls_raw urls=()
+    urls_raw=$(py extract_urls "$data_file" "$installer_slug") || {
+        # py()'s own HELPER_ERROR_COUNT increment happens inside this
+        # command substitution's subshell and is lost when it exits --
+        # command substitution, like process substitution, always forks.
+        # Track it here in the caller's shell instead.
+        HELPER_ERROR_COUNT=$((HELPER_ERROR_COUNT + 1))
+        log_warn "Failed to extract resource URLs for $installer_slug – treating as none found"
+    }
+    [[ -n "$urls_raw" ]] && mapfile -t urls <<< "$urls_raw"
 
     if [[ "${#urls[@]}" -eq 0 ]]; then
         log_info "No deeplink resources found"
@@ -1430,7 +1495,8 @@ process_installer_dry_run() {
 }
 
 process_installer_real() {
-    local data_file="$1" installer_slug="$2" inst_dir="$3" dir_name="$4"
+    local data_file="$1" installer_slug="$2" dir_name="$3"
+    local inst_dir="$OUTPUT_DIR/$dir_name"
     local safe_slug yaml_file
     safe_slug=$(to_safe_name "$installer_slug")
     yaml_file="$inst_dir/${safe_slug}.yaml"
@@ -1460,26 +1526,33 @@ process_installer_real() {
 # e.g. a previous run's download failed (HTTP error, interrupted transfer).
 # Backed by the freshly fetched data_file, so no extra network round-trip.
 installer_has_missing_resources() {
-    local data_file="$1" installer_slug="$2" inst_dir="$3"
-    $NO_RESOURCES && return 1
-    local url fname
+    local data_file="$1" installer_slug="$2" inst_dir="$3" no_resources="$4"
+    "$no_resources" && return 1
+    local urls_raw url fname
+    urls_raw=$(py extract_urls "$data_file" "$installer_slug") || {
+        # py()'s own HELPER_ERROR_COUNT increment happens inside this
+        # command substitution's subshell and is lost when it exits --
+        # command substitution, like process substitution, always forks.
+        # Track it here in the caller's shell instead.
+        HELPER_ERROR_COUNT=$((HELPER_ERROR_COUNT + 1))
+        log_warn "Failed to extract resource URLs for $installer_slug – treating as none found"
+    }
+    [[ -z "$urls_raw" ]] && return 1
     while IFS= read -r url; do
         [[ -z "$url" ]] && continue
         fname=$(py url_to_filename "$url")
         [[ -f "$inst_dir/$fname" ]] || return 0
-    done < <(py extract_urls "$data_file" "$installer_slug")
+    done <<< "$urls_raw"
     return 1
 }
 
 process_installer() {
-    local data_file="$1" entry="$2" game_name="$3"
+    local data_file="$1" entry="$2" game_name="$3" dir_name="$4"
     local installer_slug runner updated status
     IFS=$'\t' read -r installer_slug runner updated status <<< "$entry"
     [[ -z "$installer_slug" ]] && return
 
-    local dir_name inst_dir
-    dir_name=$(make_dir_name "$installer_slug" "${updated:-0000-00-00}" "$runner" "$status")
-    inst_dir="$OUTPUT_DIR/$dir_name"
+    local inst_dir="$OUTPUT_DIR/$dir_name"
 
     echo "" >&2
     log_info "Installer : $installer_slug"
@@ -1487,7 +1560,7 @@ process_installer() {
     log_info "Folder    : $dir_name"
 
     if [[ -d "$inst_dir" ]] && ! $FORCE; then
-        if installer_has_missing_resources "$data_file" "$installer_slug" "$inst_dir"; then
+        if installer_has_missing_resources "$data_file" "$installer_slug" "$inst_dir" "$NO_RESOURCES"; then
             log_info "Already cached but missing resource(s) – retrying downloads only"
         else
             log_skip "Already cached – skipping"
@@ -1499,7 +1572,7 @@ process_installer() {
     if $DRY_RUN; then
         process_installer_dry_run "$data_file" "$installer_slug" "$dir_name"
     else
-        process_installer_real "$data_file" "$installer_slug" "$inst_dir" "$dir_name" || return
+        process_installer_real "$data_file" "$installer_slug" "$dir_name" || return
     fi
 
     SUCCESS_INSTALLERS+=("$game_name  →  $dir_name$(${DRY_RUN} && echo '  [DRY-RUN]')")
@@ -1517,22 +1590,22 @@ process_game() {
         if [[ -n "$cached_slug" ]] \
            && py cache_check "$SLUG_CACHE_FILE" "$game_key" "$OUTPUT_DIR" "$NO_RESOURCES"; then
             log_info "All installers cached → skipping API calls"
-            SKIPPED_GAMES+=("$game_name  [fully cached, use --force to refresh]")
+            SKIPPED_GAMES+=("$game_name  $SKIP_FULLY_CACHED")
             return
         fi
     fi
 
-    local game_slug
-    game_slug=$(resolve_game_slug "$game_name")
+    local game_slug rc
+    game_slug=$(resolve_game_slug "$game_name"); rc=$?
 
-    if [[ "$game_slug" == "API_ERROR" ]]; then
-        SKIPPED_GAMES+=("$game_name  [API unreachable]")
+    if [[ "$rc" -eq 2 ]]; then
+        SKIPPED_GAMES+=("$game_name  $SKIP_API_UNREACHABLE")
         API_ERROR_COUNT=$((API_ERROR_COUNT + 1))
         return
     fi
     if [[ -z "$game_slug" ]]; then
         log_warn "No game found on lutris.net → skipped"
-        SKIPPED_GAMES+=("$game_name  [not found on lutris.net]")
+        SKIPPED_GAMES+=("$game_name  $SKIP_NOT_FOUND")
         return
     fi
 
@@ -1562,7 +1635,7 @@ process_game() {
 
     if [[ "${#installers[@]}" -eq 0 ]]; then
         log_warn "No installers found → skipped"
-        SKIPPED_GAMES+=("$game_name  [no installers on lutris.net]")
+        SKIPPED_GAMES+=("$game_name  $SKIP_NO_INSTALLERS")
         rm -f "$tmp_game"; return
     fi
 
@@ -1570,11 +1643,12 @@ process_game() {
 
     local installer_dirs=()
     for entry in "${installers[@]}"; do
-        local slug runner updated status
+        local slug runner updated status dir_name
         IFS=$'\t' read -r slug runner updated status <<< "$entry"
         [[ -z "$slug" ]] && continue
-        installer_dirs+=("$(make_dir_name "$slug" "${updated:-0000-00-00}" "$runner" "$status")")
-        process_installer "$tmp_game" "$entry" "$game_name"
+        dir_name=$(make_dir_name "$slug" "${updated:-0000-00-00}" "$runner" "$status")
+        installer_dirs+=("$dir_name")
+        process_installer "$tmp_game" "$entry" "$game_name" "$dir_name"
     done
 
     if ! $DRY_RUN; then
@@ -1656,7 +1730,6 @@ localize_installer_yaml() {
     local patched
     if patched=$(py localize_yaml "$yaml_file" "$resource_dir" "$offline_yaml"); then
         log_ok "Offline YAML saved: $(basename "$offline_yaml")  (${patched:-0} URLs localized)"
-        LOCALIZED_YAMLS+=("$offline_yaml")
     else
         log_error "Offline YAML generation failed: $(basename "$yaml_file")"
         log_error "  → see $PY_ERROR_LOG"
