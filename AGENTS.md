@@ -26,7 +26,8 @@ the source of truth for documented flags and output structure.
 There is no separate Python file on disk: a Python helper script is generated
 at runtime by `_write_helper_python()` (a heredoc inside `ottercache`) and
 written to a temp file (`$HELPER_PY`, via `mktemp`), then invoked through the
-`py()` / `py_tracked()` wrappers. If you need to change Python-side logic
+`py()` wrapper (which also tracks genuine helper failures — exit codes ≥2 —
+into `HELPER_ERROR_COUNT`). If you need to change Python-side logic
 (YAML parsing/generation, JSON handling, slug/name matching), edit the
 heredoc inside `_write_helper_python()` in `ottercache`, not a separate file.
 
@@ -40,7 +41,7 @@ heredoc inside `_write_helper_python()` in `ottercache`, not a separate file.
 2. Global state (`declare -A GAMES=()`, arrays for broken links, errors,
    skipped/duplicate games, etc.)
 3. `_write_helper_python()` — the embedded Python helper
-4. `py()` / `py_tracked()` — wrappers to invoke the helper
+4. `py()` — wrapper to invoke the helper
 5. CLI: `print_usage`, `parse_args`
 6. Setup: `setup_output_dirs`, `acquire_lock` / `release_lock` (flock-based),
    `start_logging`, `setup_helper_python`, `cleanup` (registered via `trap
